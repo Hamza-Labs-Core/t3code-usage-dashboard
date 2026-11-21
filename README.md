@@ -1,4 +1,4 @@
-# Usage dashboard
+# T3 Code usage dashboard
 
 A local, read-only dashboard for AI coding usage, cost and plan limits, styled after T3 Code's Usage screen.
 
