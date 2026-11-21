@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Usage</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <nav class="crumbs" aria-label="Breadcrumb">
+        <span class="crumb-muted">Local</span>
+        <span class="crumb-sep" aria-hidden="true">/</span>
+        <span id="crumbTitle" class="crumb">Usage</span>
+      </nav>
+      <span id="windowLabel" class="window-label"></span>
+      <div class="topbar-actions">
+        <div id="periodGroup" class="segmented" role="group" aria-label="Usage period">
+          <button type="button" data-days="1">Past 24h</button>
+          <button type="button" data-days="7">7 days</button>
+          <button type="button" data-days="30">30 days</button>
+          <button type="button" data-days="90">90 days</button>
+        </div>
+        <div id="metricGroup" class="segmented" role="group" aria-label="Usage metric">
+          <button type="button" data-metric="cost">Cost</button>
+          <button type="button" data-metric="tokens">Tokens</button>
+          <button type="button" data-metric="limits">Limits</button>
+        </div>
+        <button id="refresh" class="icon-button" type="button" aria-label="Refresh usage" title="Refresh">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="scroll">
+      <div class="container">
+        <div id="notices"></div>
+        <div id="usageView" class="stack-6"></div>
+        <div id="limitsView" class="stack-6" hidden></div>
+      </div>
+    </main>
+  </div>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

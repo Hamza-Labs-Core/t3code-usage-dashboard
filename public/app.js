@@ -1,0 +1,622 @@
+const $ = (id) => document.getElementById(id);
+
+const PROVIDERS = {
+  claude: { label: "Claude Code", color: "#d97757" },
+  codex: { label: "Codex", color: "var(--contrast-foreground)" },
+  grok: { label: "Grok Build", color: "color-mix(in oklab, var(--contrast-foreground) 72%, var(--background))" },
+  cursor: { label: "Cursor", color: "#8b8b8b" },
+  opencode: { label: "OpenCode", color: "#5b9bbd" },
+  antigravity: { label: "Antigravity", color: "#8c7bd1" },
+  pi: { label: "Pi", color: "#4d9f8a" },
+  muse: { label: "Muse Code", color: "#0866ff" },
+  zai: { label: "Z.ai / GLM", color: "#3fa37a" },
+  kimi: { label: "Kimi Code", color: "#c9a13b" },
+};
+const providerLabel = (provider) => PROVIDERS[provider]?.label ?? provider ?? "Unknown";
+const providerColor = (provider) => PROVIDERS[provider]?.color ?? "var(--muted-foreground)";
+const ink = (percent) => `color-mix(in oklab, var(--foreground) ${percent}%, var(--background))`;
+const TYPE_COLORS = { input: ink(60), cacheRead: ink(30), cacheWrite: ink(72), output: ink(100) };
+
+const usd = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const usdWhole = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+const compactFmt = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const countFmt = new Intl.NumberFormat();
+const formatUsd = (value) => usd.format(value ?? 0);
+const formatTokens = (value) => compactFmt.format(value ?? 0);
+const formatCount = (value) => countFmt.format(Math.round(value ?? 0));
+const formatPercent = (share) => {
+  const percent = share * 100;
+  if (percent > 0 && percent < 1) return "<1%";
+  return `${Math.round(percent)}%`;
+};
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+const plural = (count, one, other) => `${formatCount(count)} ${count === 1 ? one : other}`;
+
+const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const dayKey = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+const dayShort = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+const hourShort = new Intl.DateTimeFormat(undefined, { hour: "numeric" });
+const dateTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+function readPreference(key, fallback, valid) {
+  try {
+    const value = localStorage.getItem(`usage.${key}`);
+    return value !== null && valid(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writePreference(key, value) {
+  try { localStorage.setItem(`usage.${key}`, value); } catch { /* storage unavailable */ }
+}
+
+const state = {
+  days: Number(readPreference("days", "7", (v) => ["1", "7", "30", "90"].includes(v))),
+  metric: readPreference("metric", "cost", (v) => ["cost", "tokens", "limits"].includes(v)),
+  breakdown: "model",
+  data: null,
+  loading: false,
+  requestId: 0,
+};
+
+function windowBounds(days = state.days) {
+  const until = Date.now();
+  if (days === 1) return { since: until - 86400000, until };
+  const start = new Date(until);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - days + 1);
+  return { since: start.getTime(), until };
+}
+
+function periodsFor(meta) {
+  const hourly = meta.untilMs - meta.sinceMs <= 36 * 3600000;
+  if (hourly) {
+    const periods = [];
+    for (let hour = Math.floor(meta.sinceMs / 3600000); hour <= Math.floor((meta.untilMs - 1) / 3600000); hour++) {
+      periods.push(new Date(hour * 3600000).toISOString());
+    }
+    return { hourly, periods };
+  }
+  const periods = [];
+  for (let at = meta.sinceMs + 12 * 3600000; ; at += 86400000) {
+    const key = dayKey.format(new Date(Math.min(at, meta.untilMs)));
+    if (periods.at(-1) !== key) periods.push(key);
+    if (at >= meta.untilMs) break;
+  }
+  return { hourly, periods };
+}
+const formatPeriod = (period, hourly) =>
+  hourly ? hourShort.format(new Date(period)) : dayShort.format(new Date(`${period}T12:00:00`));
+
+// Each period's response is reused for a minute, and the other periods are fetched in the
+// background after the first load, so switching periods renders without waiting on the server.
+const periodCache = new Map();
+const PERIOD_TTL_MS = 60000;
+
+async function fetchPeriod(days, force = false) {
+  const query = new URLSearchParams({ ...windowBounds(days), timeZone });
+  if (force) query.set("refresh", "1");
+  const response = await fetch(`/api/dashboard?${query}`);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error ?? "Could not read usage.");
+  periodCache.set(days, { data: body, at: Date.now() });
+  return body;
+}
+
+async function prefetchOtherPeriods() {
+  for (const days of [1, 7, 30, 90]) {
+    const held = periodCache.get(days);
+    if (held && Date.now() - held.at < PERIOD_TTL_MS) continue;
+    try { await fetchPeriod(days); } catch { /* the period loads on demand instead */ }
+  }
+}
+
+async function load(force = false) {
+  const requestId = ++state.requestId;
+  const days = state.days;
+  if (force) periodCache.clear();
+  const held = periodCache.get(days);
+  if (held) {
+    state.data = held.data;
+    syncControls();
+    render();
+    if (Date.now() - held.at < PERIOD_TTL_MS) return;
+  }
+  state.loading = true;
+  syncControls();
+  document.body.classList.add("loading");
+  try {
+    const body = await fetchPeriod(days, force);
+    if (requestId !== state.requestId) return;
+    state.data = body;
+    $("notices").replaceChildren();
+    render();
+    prefetchOtherPeriods();
+  } catch (error) {
+    if (requestId !== state.requestId) return;
+    $("notices").innerHTML = `<p class="notice error">${escapeHtml(error.message)}</p>`;
+  } finally {
+    if (requestId === state.requestId) {
+      state.loading = false;
+      document.body.classList.remove("loading");
+      syncControls();
+    }
+  }
+}
+
+function syncControls() {
+  for (const button of document.querySelectorAll("[data-days]")) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.days) === state.days));
+  }
+  for (const button of document.querySelectorAll("[data-metric]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.metric === state.metric));
+  }
+  const limits = state.metric === "limits";
+  $("periodGroup").hidden = limits;
+  $("windowLabel").hidden = limits;
+  $("crumbTitle").textContent = limits ? "Limits" : "Usage";
+  $("usageView").hidden = limits;
+  $("limitsView").hidden = !limits;
+  $("refresh").setAttribute("aria-busy", String(state.loading));
+  $("refresh").disabled = state.loading;
+  $("refresh").setAttribute("aria-label", limits ? "Refresh limits" : "Refresh usage");
+}
+
+function render() {
+  const data = state.data;
+  if (!data) return;
+  const { meta } = data;
+  $("windowLabel").textContent = `${dateTime.format(new Date(meta.sinceMs))} – ${dateTime.format(new Date(meta.untilMs))}`;
+  const problems = data.sources.filter((source) => source.status !== "ok" && source.message);
+  $("notices").innerHTML = problems.map((source) => `<p class="notice">${escapeHtml(source.label)}: ${escapeHtml(source.message)}</p>`).join("");
+  renderUsage();
+  renderLimits();
+}
+
+/* ---------- Usage ---------- */
+
+function renderUsage() {
+  const data = state.data;
+  const metric = state.metric === "tokens" ? "tokens" : "cost";
+  const value = (row) => (metric === "tokens" ? row.totalTokens : row.costUsd);
+  const summary = data.summary;
+  const providers = data.providers.filter((row) => row.totalTokens > 0 || row.costUsd > 0).sort((a, b) => value(b) - value(a));
+  const totalCost = providers.reduce((sum, row) => sum + row.costUsd, 0);
+  const totalTokens = providers.reduce((sum, row) => sum + row.totalTokens, 0);
+  const unpricedShare = summary.totalTokens > 0 ? summary.unpricedTokens / summary.totalTokens : 0;
+  const { hourly, periods } = periodsFor(data.meta);
+
+  const providerRows = providers.map((row) => {
+    const share = metric === "cost" ? (totalCost > 0 ? row.costUsd / totalCost : 0) : (totalTokens > 0 ? row.totalTokens / totalTokens : 0);
+    const sub = metric === "cost"
+      ? `${formatPercent(share)} of cost · ${formatTokens(row.totalTokens)} tokens`
+      : `${formatPercent(share)} of tokens · ${formatUsd(row.costUsd)}`;
+    return `<div class="provider">
+      <dl>
+        <dt><span class="dot" style="background:${providerColor(row.provider)}"></span>
+          <span class="truncate">${escapeHtml(providerLabel(row.provider))}</span>
+          <span class="sessions figure">${plural(row.sessions, "session", "sessions")}</span></dt>
+        <dd class="figure">${metric === "cost" ? (row.costSource === "unpriced" ? '<span class="muted">Unpriced</span>' : formatUsd(row.costUsd)) : formatTokens(row.totalTokens)}</dd>
+      </dl>
+      <p class="provider-sub figure">${sub}</p>
+    </div>`;
+  }).join("");
+
+  const unpricedInfo = metric === "cost" && unpricedShare > 0
+    ? `<span class="info" data-tip="API estimate excludes ${escapeHtml(formatPercent(unpricedShare))} unpriced tokens.">${infoIcon}</span>`
+    : "";
+
+  const chartTitle = hourly ? (metric === "tokens" ? "Hourly processed tokens" : "Hourly cost") : (metric === "tokens" ? "Daily processed tokens" : "Daily cost");
+  const totals = summary.totals;
+  const shares = metric === "tokens"
+    ? shareBar("Tokens by type", [
+        ["Input", totals.uncachedInputTokens, TYPE_COLORS.input],
+        ["Cache read", totals.cachedInputTokens, TYPE_COLORS.cacheRead],
+        ["Cache write", totals.cacheCreationTokens, TYPE_COLORS.cacheWrite],
+        ["Output", totals.outputTokens, TYPE_COLORS.output],
+      ], formatTokens)
+    : shareBar("Cost by type", [
+        ["Input", summary.categoryCostUsd.input, TYPE_COLORS.input],
+        ["Cache read", summary.categoryCostUsd.cacheRead, TYPE_COLORS.cacheRead],
+        ["Cache write", summary.categoryCostUsd.cacheWrite, TYPE_COLORS.cacheWrite],
+        ["Output", summary.categoryCostUsd.output, TYPE_COLORS.output],
+      ], formatUsd);
+
+  $("usageView").innerHTML = `
+    <section class="overview">
+      <div class="overview-left">
+        <div class="headline">
+          <p class="headline-value figure">${metric === "cost" ? formatUsd(summary.costUsd) : formatTokens(summary.totalTokens)}</p>
+          <p class="headline-sub"><span><span class="figure">${plural(summary.sessions, "session", "sessions")}</span>${metric === "cost" ? " · API estimate" : ""}</span>${unpricedInfo}</p>
+        </div>
+        ${providerRows || '<p class="muted">No activity in this window.</p>'}
+      </div>
+      <div class="chart-col">
+        <h2>${chartTitle}</h2>
+        <div id="chart"></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Totals</h2>
+      <dl class="metrics">
+        ${metricCell("Processed tokens", formatTokens(summary.totalTokens))}
+        ${metricCell("Cached input", formatTokens(totals.cachedInputTokens))}
+        ${metricCell("Uncached input", formatTokens(totals.uncachedInputTokens))}
+        ${metricCell("Output", formatTokens(totals.outputTokens))}
+        ${metricCell("Cache savings", formatUsd(summary.cacheSavingsUsd))}
+      </dl>
+    </section>
+
+    ${summary.totalTokens > 0 ? `<section class="shares figure">${shares}</section>` : ""}
+
+    <section class="section section-gap-3">
+      <div class="section-head">
+        <h2>Breakdown</h2>
+        <div class="segmented" role="group" aria-label="Usage breakdown">
+          <button type="button" data-breakdown="model" aria-pressed="${state.breakdown === "model"}">Model</button>
+          <button type="button" data-breakdown="time" aria-pressed="${state.breakdown === "time"}">${hourly ? "Hour" : "Day"}</button>
+        </div>
+      </div>
+      <div class="table-wrap">${state.breakdown === "model" ? modelTable(metric) : timeTable(providers, periods, hourly)}</div>
+    </section>
+
+    ${footnote()}
+  `;
+  renderChart(providers.map((row) => row.provider), periods, hourly, metric);
+}
+
+const metricCell = (label, value) => `<div class="metric"><dt>${label}</dt><dd class="figure">${value}</dd></div>`;
+
+function shareBar(label, segments, format) {
+  const visible = segments.filter(([, value]) => value > 0);
+  const total = visible.reduce((sum, [, value]) => sum + value, 0);
+  if (total <= 0) return "";
+  return `<div class="share">
+    <h3>${label}</h3>
+    <div class="share-bar" aria-hidden="true">${visible.map(([name, value, color]) =>
+      `<div style="flex:${value} 1 0;background:${color}" data-tip="${escapeHtml(`${name} · ${format(value)} · ${formatPercent(value / total)}`)}"></div>`).join("")}</div>
+    <ul class="share-legend" aria-label="${label}">${visible.map(([name, value, color]) =>
+      `<li><span class="swatch" style="background:${color}"></span><span class="muted">${name}</span> <span class="tabular">${format(value)}</span></li>`).join("")}</ul>
+  </div>`;
+}
+
+function modelTable(metric) {
+  const models = [...state.data.models].sort((a, b) => (metric === "tokens" ? b.totalTokens - a.totalTokens : b.costUsd - a.costUsd || b.totalTokens - a.totalTokens));
+  const field = (model) => (metric === "tokens" ? model.totalTokens : model.costUsd);
+  const peak = models.reduce((max, model) => Math.max(max, field(model)), 0);
+  const total = models.reduce((sum, model) => sum + field(model), 0);
+  const rows = models.map((model, index) => {
+    const v = field(model);
+    const bar = v > 0 && peak > 0
+      ? `<div class="mini-bar figure"><div style="width:max(0.5rem, ${(v / peak) * 100}%);background:${providerColor(model.provider)}"></div></div>`
+      : "";
+    const unpriced = model.costSource === "unpriced" && model.totalTokens > 0;
+    return `<tr>
+      <td style="font-size:12px">${index + 1}</td>
+      <td class="left wrap" style="width:100%"><div class="model-cell"><span class="dot" style="background:${providerColor(model.provider)}" title="${escapeHtml(providerLabel(model.provider))}"></span>${escapeHtml(model.model)}</div>${bar}</td>
+      <td class="fg figure">${unpriced ? '<span class="muted">Unpriced</span>' : formatUsd(model.costUsd)}</td>
+      <td class="hide-sm figure">${total > 0 && !(metric === "cost" && unpriced) ? formatPercent(v / total) : ""}</td>
+      <td class="figure">${formatTokens(model.totalTokens)}</td>
+    </tr>`;
+  }).join("");
+  return `<table>
+    <thead><tr><th>#</th><th class="left" style="width:100%">Model</th><th>Cost</th><th class="hide-sm">Share</th><th>Tokens</th></tr></thead>
+    <tbody>${rows || '<tr class="empty-row"><td colspan="5">No activity in this window.</td></tr>'}</tbody>
+  </table>`;
+}
+
+function timeTable(providers, periods, hourly) {
+  const byPeriod = new Map();
+  for (const point of state.data.trend) {
+    const entry = byPeriod.get(point.bucket) ?? { cost: 0, tokens: 0, byProvider: new Map() };
+    entry.cost += point.costUsd;
+    entry.tokens += point.tokens;
+    entry.byProvider.set(point.provider, point.costUsd);
+    byPeriod.set(point.bucket, entry);
+  }
+  const list = periods.filter((period) => byPeriod.has(period)).reverse();
+  const rows = list.map((period) => {
+    const entry = byPeriod.get(period);
+    return `<tr>
+      <td class="fg">${formatPeriod(period, hourly)}</td>
+      ${providers.map((row) => `<td class="figure">${formatUsd(entry.byProvider.get(row.provider) ?? 0)}</td>`).join("")}
+      <td class="fg figure">${formatUsd(entry.cost)}</td>
+      <td class="figure">${formatTokens(entry.tokens)}</td>
+    </tr>`;
+  }).join("");
+  return `<table>
+    <colgroup><col style="width:40%"></colgroup>
+    <thead><tr><th>${hourly ? "Hour" : "Day"}</th>${providers.map((row) => `<th>${escapeHtml(providerLabel(row.provider))}</th>`).join("")}<th>Total</th><th>Tokens</th></tr></thead>
+    <tbody>${rows || `<tr class="empty-row"><td colspan="${providers.length + 3}">No activity in this window.</td></tr>`}</tbody>
+  </table>`;
+}
+
+function footnote() {
+  const { sources, meta } = state.data;
+  const parts = sources.map((source) => {
+    const size = source.files !== undefined ? plural(source.files, "file", "files") : plural(source.records ?? 0, "record", "records");
+    const status = source.status === "ok" ? "" : ` <span class="src-error">(${escapeHtml(source.status)})</span>`;
+    return `${escapeHtml(source.label)} · ${size}${status}`;
+  });
+  const pricing = meta.pricingFetchedAt ? `Prices from T3's rate table, fetched ${dateTime.format(new Date(meta.pricingFetchedAt))}. Kimi Code is priced at Moonshot API rates.` : "No cached rate table found.";
+  return `<div class="footnote"><span>Sources: ${parts.join(" &nbsp;·&nbsp; ")}</span><span>${pricing} Costs are API estimates, not your subscription bill.</span></div>`;
+}
+
+/* ---------- Chart (layered monotone lines, as in T3's UsageProviderChart) ---------- */
+
+const VIEW_WIDTH = 960;
+const VIEW_HEIGHT = 260;
+const PLOT_TOP = 8;
+const TICK_COUNT = 4;
+
+function niceScale(peak) {
+  if (peak <= 0) return { max: TICK_COUNT, ticks: [0, 1, 2, 3, 4] };
+  const raw = peak / TICK_COUNT;
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((n) => n * magnitude).find((n) => n >= raw);
+  return { max: step * TICK_COUNT, ticks: Array.from({ length: TICK_COUNT + 1 }, (_, i) => i * step) };
+}
+
+function monotonePath(points) {
+  if (points.length === 0) return "";
+  if (points.length === 1) return `M${points[0].x},${points[0].y}`;
+  const n = points.length;
+  const slopes = [];
+  for (let i = 0; i < n - 1; i++) slopes.push((points[i + 1].y - points[i].y) / (points[i + 1].x - points[i].x));
+  const tangents = [slopes[0]];
+  for (let i = 1; i < n - 1; i++) tangents.push(slopes[i - 1] * slopes[i] <= 0 ? 0 : (slopes[i - 1] + slopes[i]) / 2);
+  tangents.push(slopes[n - 2]);
+  for (let i = 0; i < n - 1; i++) {
+    if (slopes[i] === 0) { tangents[i] = 0; tangents[i + 1] = 0; continue; }
+    const a = tangents[i] / slopes[i];
+    const b = tangents[i + 1] / slopes[i];
+    const h = a * a + b * b;
+    if (h > 9) { const t = 3 / Math.sqrt(h); tangents[i] = t * a * slopes[i]; tangents[i + 1] = t * b * slopes[i]; }
+  }
+  let path = `M${points[0].x.toFixed(2)},${points[0].y.toFixed(2)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const p = points[i], q = points[i + 1], dx = (q.x - p.x) / 3;
+    path += ` C${(p.x + dx).toFixed(2)},${(p.y + tangents[i] * dx).toFixed(2)} ${(q.x - dx).toFixed(2)},${(q.y - tangents[i + 1] * dx).toFixed(2)} ${q.x.toFixed(2)},${q.y.toFixed(2)}`;
+  }
+  return path;
+}
+
+function renderChart(providers, periods, hourly, metric) {
+  const host = $("chart");
+  const byKey = new Map(state.data.trend.map((point) => [`${point.bucket}\0${point.provider}`, point]));
+  const valueAt = (period, provider) => {
+    const point = byKey.get(`${period}\0${provider}`);
+    return point ? (metric === "tokens" ? point.tokens : point.costUsd) : 0;
+  };
+  if (providers.length === 0 || periods.length === 0) {
+    host.innerHTML = '<div class="chart-empty">No activity in this window.</div>';
+    return;
+  }
+  const peak = Math.max(0, ...periods.flatMap((period) => providers.map((provider) => valueAt(period, provider))));
+  const scale = niceScale(peak);
+  const toY = (value) => VIEW_HEIGHT - (value / scale.max) * (VIEW_HEIGHT - PLOT_TOP);
+  const stepX = periods.length > 1 ? VIEW_WIDTH / (periods.length - 1) : 0;
+  const toX = (index) => (periods.length > 1 ? index * stepX : VIEW_WIDTH / 2);
+  const format = metric === "tokens" ? formatTokens : formatUsd;
+  const axisFormat = metric === "tokens" ? formatTokens : (value) => (value >= 10 ? usdWhole.format(value) : formatUsd(value));
+
+  const grid = scale.ticks.map((tick) => `<line x1="0" x2="${VIEW_WIDTH}" y1="${toY(tick)}" y2="${toY(tick)}" stroke="var(--border)" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join("");
+  const series = providers.map((provider) => {
+    const points = periods.map((period, index) => ({ x: toX(index), y: toY(valueAt(period, provider)) }));
+    const line = monotonePath(points);
+    const area = `${line} L${points.at(-1).x.toFixed(2)},${VIEW_HEIGHT} L${points[0].x.toFixed(2)},${VIEW_HEIGHT} Z`;
+    return { provider, line, area };
+  });
+  const areas = series.map((s) => `<path d="${s.area}" fill="${providerColor(s.provider)}" fill-opacity="0.12"/>`).join("");
+  const lines = series.map((s) => `<path d="${s.line}" fill="none" stroke="${providerColor(s.provider)}" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join("");
+  const yLabels = scale.ticks.map((tick) => `<span style="top:${(toY(tick) / VIEW_HEIGHT) * 100}%">${tick === 0 ? "0" : escapeHtml(axisFormat(tick))}</span>`).join("");
+  const mid = periods[Math.floor(periods.length / 2)];
+
+  host.innerHTML = `<div class="chart">
+    <div class="chart-row">
+      <div class="y-axis" aria-hidden="true">${yLabels}</div>
+      <div class="plot" role="img" aria-label="${escapeHtml(`${hourly ? "Hourly" : "Daily"} ${metric === "tokens" ? "tokens" : "cost"} by provider`)}">
+        <svg viewBox="0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}" preserveAspectRatio="none">
+          ${grid}${areas}${lines}
+          <line id="guide" x1="0" x2="0" y1="${PLOT_TOP}" y2="${VIEW_HEIGHT}" stroke="var(--muted-foreground)" stroke-width="1" stroke-dasharray="3 3" vector-effect="non-scaling-stroke" visibility="hidden"/>
+        </svg>
+      </div>
+    </div>
+    <div class="x-axis" aria-hidden="true"><span>${formatPeriod(periods[0], hourly)}</span><span>${formatPeriod(mid, hourly)}</span><span>${formatPeriod(periods.at(-1), hourly)}</span></div>
+  </div>`;
+
+  const plot = host.querySelector(".plot");
+  const guide = host.querySelector("#guide");
+  plot.addEventListener("pointermove", (event) => {
+    const bounds = plot.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+    const index = periods.length > 1 ? Math.round(ratio * (periods.length - 1)) : 0;
+    const period = periods[index];
+    const x = toX(index);
+    guide.setAttribute("x1", x);
+    guide.setAttribute("x2", x);
+    guide.setAttribute("visibility", "visible");
+    const values = providers.map((provider) => [provider, valueAt(period, provider)]).sort((a, b) => b[1] - a[1]);
+    const total = values.reduce((sum, [, v]) => sum + v, 0);
+    showTooltip(`<div class="tt-title">${escapeHtml(formatPeriod(period, hourly))}</div>
+      ${values.map(([provider, v]) => `<div class="tt-row"><span><span class="dot" style="background:${providerColor(provider)}"></span>${escapeHtml(providerLabel(provider))}</span><span class="tt-value">${escapeHtml(format(v))}</span></div>`).join("")}
+      <div class="tt-row tt-total"><span>Total</span><span class="tt-value">${escapeHtml(format(total))}</span></div>`,
+      bounds.left + (x / VIEW_WIDTH) * bounds.width, bounds.top);
+  });
+  plot.addEventListener("pointerleave", () => {
+    guide.setAttribute("visibility", "hidden");
+    hideTooltip();
+  });
+}
+
+/* ---------- Limits (mirrors T3's LimitWindows: % left, pace mark, resets in) ---------- */
+
+const PACE = {
+  over: { label: "Over pace: at this rate you'll run out before the window resets", icon: '<path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/>' },
+  on: { label: "On pace with the window", icon: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>' },
+  under: { label: "Under pace: headroom left for the rest of the window", icon: '<path d="m22 17-8.5-8.5-5 5L2 7"/><path d="M16 17h6v-6"/>' },
+};
+
+function windowTiming(window, now) {
+  if (!window.resetsAt || !window.windowDurationMins) return null;
+  const durationMs = window.windowDurationMins * 60000;
+  const left = Date.parse(window.resetsAt) - now;
+  if (!Number.isFinite(left)) return null;
+  return Math.min(100, Math.max(0, Math.round((left / durationMs) * 100)));
+}
+
+function paceOf(window, timeLeft) {
+  if (timeLeft === null) return null;
+  const elapsed = 100 - timeLeft;
+  if (elapsed < 2) return null;
+  if (window.usedPercent > elapsed + 5) return "over";
+  if (window.usedPercent < elapsed - 5) return "under";
+  return "on";
+}
+
+function resetsIn(window, now) {
+  if (!window.resetsAt) return null;
+  const ms = Date.parse(window.resetsAt) - now;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const minutes = Math.round(ms / 60000);
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${Math.max(1, mins)}m`;
+}
+
+function ago(iso, now) {
+  const minutes = Math.round((now - Date.parse(iso)) / 60000);
+  if (!Number.isFinite(minutes)) return "";
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  return dateTime.format(new Date(iso));
+}
+
+function safeLink(value) {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderLimits() {
+  const now = Date.now();
+  const accounts = state.data.limits;
+  if (accounts.length === 0) {
+    $("limitsView").innerHTML = '<p class="muted">No provider reports limits.</p>';
+    return;
+  }
+  $("limitsView").innerHTML = `<div class="limits">${accounts.map((account) => {
+    const color = providerColor(account.provider);
+    const link = account.externalUsage?.url ? safeLink(account.externalUsage.url) : null;
+    const checked = account.checkedAt ? ` · checked ${ago(account.checkedAt, now)}` : "";
+    const staleNote = account.stale
+      ? `<p class="account-empty">Showing the last reading. ${escapeHtml(account.stale.reason)}</p>`
+      : "";
+    const windows = account.windows?.length
+      ? `${staleNote}<div class="windows${account.stale ? " stale" : ""}">${account.windows.map((window) => {
+          const remaining = Math.max(0, Math.round(100 - window.usedPercent));
+          const timeLeft = windowTiming(window, now);
+          const pace = paceOf(window, timeLeft);
+          const resets = resetsIn(window, now);
+          const resetAt = window.resetsAt ? dateTime.format(new Date(window.resetsAt)) : null;
+          const tip = [
+            timeLeft !== null ? `${remaining}% left · ${timeLeft}% of the window left` : `${remaining}% left`,
+            timeLeft !== null ? "The line is where even spending would be." : null,
+            resetAt ? `Resets ${resetAt}${resets ? ` · in ${resets}` : ""}` : null,
+          ].filter(Boolean).join("\n");
+          const tickAt = timeLeft === null ? null : `clamp(3px, ${timeLeft}%, calc(100% - 3px))`;
+          return `
+            <span class="win-label"><span class="truncate muted">${escapeHtml(window.label)}</span><span class="left">${remaining}% left</span></span>
+            <div class="win-bar" role="img" tabindex="0" aria-label="${escapeHtml(`${window.label}: ${tip.replace(/\n/g, ", ")}`)}" data-tip="${escapeHtml(tip)}">
+              <div class="track"></div>
+              ${remaining > 0 ? `<div class="fill" style="width:${remaining}%;background:${color}"></div>` : ""}
+              ${tickAt ? `<span class="tick" style="left:${tickAt}"></span>` : ""}
+            </div>
+            <span class="win-meta">${pace ? `<span class="pace" data-tip="${escapeHtml(PACE[pace].label)}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="${escapeHtml(PACE[pace].label)}">${PACE[pace].icon}</svg></span>` : ""}<span class="resets">${resets ? `in ${resets}` : ""}</span></span>`;
+        }).join("")}</div>`
+      : `<p class="account-empty">${escapeHtml(account.unavailable?.message ?? "No limit windows reported.")}</p>`;
+    return `<section class="account">
+      <div class="account-head">
+        <span class="account-name"><span class="dot" style="background:${color}"></span>${escapeHtml(account.label)}</span>
+        <span class="account-meta">${escapeHtml(account.source ?? "")}${escapeHtml(checked)}</span>
+        ${link ? `<a class="account-link" href="${escapeHtml(link)}" target="_blank" rel="noreferrer">Manage usage ↗</a>` : ""}
+      </div>
+      ${windows}
+    </section>`;
+  }).join("")}</div>`;
+}
+
+/* ---------- Tooltips ---------- */
+
+const infoIcon = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
+
+function showTooltip(html, x, y) {
+  const tip = $("tooltip");
+  tip.innerHTML = html;
+  tip.hidden = false;
+  const { width, height } = tip.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - width - 8, Math.max(8, x - width / 2));
+  const top = y - height - 8 < 8 ? y + 24 : y - height - 8;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+const hideTooltip = () => { $("tooltip").hidden = true; };
+
+function tipTarget(event) {
+  return event.target instanceof Element ? event.target.closest("[data-tip]") : null;
+}
+document.addEventListener("pointerover", (event) => {
+  const target = tipTarget(event);
+  if (!target) return;
+  const bounds = target.getBoundingClientRect();
+  const lines = target.dataset.tip.split("\n").map((line, i) => `<div class="${i === 0 ? "" : "tt-note"}">${escapeHtml(line)}</div>`).join("");
+  showTooltip(lines, bounds.left + bounds.width / 2, bounds.top);
+});
+document.addEventListener("pointerout", (event) => {
+  if (tipTarget(event) && !event.relatedTarget?.closest?.("[data-tip]")) hideTooltip();
+});
+document.addEventListener("focusin", (event) => {
+  const target = tipTarget(event);
+  if (!target) return;
+  const bounds = target.getBoundingClientRect();
+  showTooltip(escapeHtml(target.dataset.tip).replace(/\n/g, "<br>"), bounds.left + bounds.width / 2, bounds.top);
+});
+document.addEventListener("focusout", hideTooltip);
+
+/* ---------- Controls ---------- */
+
+for (const button of document.querySelectorAll("[data-days]")) {
+  button.addEventListener("click", () => {
+    state.days = Number(button.dataset.days);
+    writePreference("days", String(state.days));
+    load();
+  });
+}
+for (const button of document.querySelectorAll("[data-metric]")) {
+  button.addEventListener("click", () => {
+    state.metric = button.dataset.metric;
+    writePreference("metric", state.metric);
+    syncControls();
+    render();
+  });
+}
+$("usageView").addEventListener("click", (event) => {
+  const button = event.target instanceof Element ? event.target.closest("[data-breakdown]") : null;
+  if (!button) return;
+  state.breakdown = button.dataset.breakdown;
+  renderUsage();
+});
+$("refresh").addEventListener("click", () => load(true));
+setInterval(() => { if (state.metric === "limits" && state.data) renderLimits(); }, 60000);
+
+syncControls();
+load();
