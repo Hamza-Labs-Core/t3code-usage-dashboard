@@ -71,8 +71,21 @@ function json(response, status, value) {
   response.end(body);
 }
 
+// Binding to 127.0.0.1 is not enough: a rebound DNS name can point a hostile page at this port.
+// Only answer requests addressed to the loopback names, and refuse cross-site API calls.
+function isLocalRequest(request) {
+  const port = server.address()?.port;
+  const allowed = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+  if (!allowed.has(request.headers.host ?? "")) return false;
+  const site = request.headers["sec-fetch-site"];
+  if (site && site !== "same-origin" && site !== "none") return false;
+  const origin = request.headers.origin;
+  return !origin || allowed.has(origin.replace(/^https?:\/\//, ""));
+}
+
 const server = http.createServer(async (request, response) => {
   try {
+    if (!isLocalRequest(request)) return json(response, 403, { error: "Forbidden." });
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname === "/api/health") return json(response, 200, { ok: true });
     if (url.pathname === "/api/dashboard") return json(response, 200, await dashboard(url));
