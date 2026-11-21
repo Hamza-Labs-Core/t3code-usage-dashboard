@@ -102,7 +102,7 @@ function zaiInstanceIds(settings) {
   return ids;
 }
 
-export function readZaiUsage(settings) {
+export function readZaiUsage(settings, sinceMs = 0) {
   const file = path.join(config.t3Userdata, "statev2.sqlite");
   const info = stat(file);
   if (!info) {
@@ -130,7 +130,8 @@ export function readZaiUsage(settings) {
         ON r.run_id = a.run_id
       WHERE th.driver = 'acpRegistry'
         AND json_extract(t.payload_json, '$.turnTokenUsage.usageStatus') IN ('complete', 'partial')
-    `).all();
+        AND COALESCE(t.completed_at, t.started_at) >= ?
+    `).all(new Date(Math.max(0, sinceMs - 36 * 3600000)).toISOString());
     const instances = zaiInstanceIds(settings);
     const records = [];
     let skipped = 0;
@@ -269,7 +270,8 @@ async function readKimiFile(file, root, sinceMs, records) {
         },
         reportedCostUsd: null,
         speed: "standard",
-        dedupeKey: `kimi:${file}:${lineNumber}`,
+        // Keyed by session, not absolute path, so a log copied between Kimi homes is counted once.
+        dedupeKey: `kimi:${sessionId}:${lineNumber}`,
       });
     }
   } finally {
@@ -288,6 +290,8 @@ export async function readKimiUsage(sinceMs) {
   for (const root of roots) await listWireFiles(root, sinceMs, files, discoveryErrors);
   const records = [];
   const errors = [...discoveryErrors];
+  const listed = new Set(files);
+  for (const held of kimiFileMemo.keys()) if (!listed.has(held) && !fs.existsSync(held)) kimiFileMemo.delete(held);
   for (const file of files) {
     const root = roots.find((candidate) => file.startsWith(candidate + path.sep)) ?? roots[0];
     try {

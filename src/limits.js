@@ -175,7 +175,13 @@ async function readZaiLimits(settings) {
   const base = environment.ACP_GLM_BASE_URL ?? "https://api.z.ai/api/coding/paas/v4";
   const credentialsFile = path.join(environment.XDG_CONFIG_HOME ?? path.join(config.home, ".config"), "glm-acp-agent", "credentials.json");
   const key = environment.Z_AI_API_KEY || readJson(credentialsFile)?.z_ai_api_key;
-  const externalUsage = { label: "Z.ai usage", url: new URL(base).hostname.endsWith("bigmodel.cn") ? "https://bigmodel.cn/coding-plan/personal/usage" : "https://z.ai/manage-apikey/coding-plan/personal/my-plan" };
+  let host = "";
+  try {
+    host = new URL(base).hostname;
+  } catch {
+    return { id: "zai-live", provider: "zai", label: "Z.ai / GLM", ...unavailable("ACP_GLM_BASE_URL is not a valid URL.", "unsupported"), source: "Z.ai quota API" };
+  }
+  const externalUsage = { label: "Z.ai usage", url: host.endsWith("bigmodel.cn") ? "https://bigmodel.cn/coding-plan/personal/usage" : "https://z.ai/manage-apikey/coding-plan/personal/my-plan" };
   if (!key) return { id: "zai-live", provider: "zai", label: "Z.ai / GLM", ...unavailable("Set Z_AI_API_KEY or configure glm-acp-agent to read live limits.", "unsupported"), externalUsage, source: "Z.ai quota API" };
   try {
     const result = await fetchJson(zaiUrl(base), { Authorization: key });
@@ -296,7 +302,7 @@ const lastGoodFile = () => path.join(config.stateDir, "last-good-limits.json");
 function saveLastGood(store) {
   try {
     fs.mkdirSync(config.stateDir, { recursive: true });
-    const temporary = `${lastGoodFile()}.${process.pid}.tmp`;
+    const temporary = `${lastGoodFile()}.${process.pid}.${crypto.randomUUID()}.tmp`;
     fs.writeFileSync(temporary, JSON.stringify(store));
     fs.renameSync(temporary, lastGoodFile());
   } catch {
@@ -342,7 +348,11 @@ export async function readLimits(settings, force = false) {
   return refreshing && !force ? refreshing.then(() => cache?.value ?? fetchLimits(settings)) : fetchLimits(settings);
 }
 
+let fetchGeneration = 0;
+
 async function fetchLimits(settings) {
+  // A slow background refresh must not replace a newer forced one that finished first.
+  const generation = ++fetchGeneration;
   const cached = readT3Limits();
   const custom = config.liveLimits
     ? withLastGood(await Promise.all([readZaiLimits(settings), readKimiLimits(settings)]))
@@ -351,6 +361,6 @@ async function fetchLimits(settings) {
         { id: "kimi-live", provider: "kimi", label: "Kimi Code", ...unavailable("Live limit lookup is disabled.", "unsupported"), source: "Kimi managed API" },
       ];
   const value = [...cached, ...custom].sort((a, b) => a.label.localeCompare(b.label));
-  cache = { time: Date.now(), value };
+  if (generation === fetchGeneration || !cache) cache = { time: Date.now(), value };
   return value;
 }

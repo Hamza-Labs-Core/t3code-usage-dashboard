@@ -94,12 +94,14 @@ const periodCache = new Map();
 const PERIOD_TTL_MS = 60000;
 
 async function fetchPeriod(days, force = false) {
+  const startedAt = Date.now();
   const query = new URLSearchParams({ ...windowBounds(days), timeZone });
   if (force) query.set("refresh", "1");
   const response = await fetch(`/api/dashboard?${query}`);
   const body = await response.json();
   if (!response.ok) throw new Error(body.error ?? "Could not read usage.");
-  periodCache.set(days, { data: body, at: Date.now() });
+  const held = periodCache.get(days);
+  if (!held || held.startedAt <= startedAt) periodCache.set(days, { data: body, at: Date.now(), startedAt });
   return body;
 }
 
@@ -616,7 +618,9 @@ $("usageView").addEventListener("click", (event) => {
   renderUsage();
 });
 $("refresh").addEventListener("click", () => load(true));
-setInterval(() => { if (state.metric === "limits" && state.data) renderLimits(); }, 60000);
+// Limits change while the page sits open: refetch (the server serves its last reading and
+// refreshes in the background) rather than only redrawing the countdowns.
+setInterval(() => { if (state.metric === "limits" && !state.loading) load(); }, 60000);
 
 syncControls();
 load();

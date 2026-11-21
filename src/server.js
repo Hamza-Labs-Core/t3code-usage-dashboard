@@ -32,7 +32,7 @@ async function dashboard(url) {
   const settings = readT3Settings();
   const pricing = readPricing(settings);
   const t3 = readT3Usage();
-  const zai = readZaiUsage(settings);
+  const zai = readZaiUsage(settings, sinceMs);
   const [kimi, limits] = await Promise.all([readKimiUsage(sinceMs), readLimits(settings, force)]);
   const sources = [t3.source, zai.source, kimi.source];
   const records = [...t3.records, ...zai.records, ...kimi.records];
@@ -86,11 +86,21 @@ function isLocalRequest(request) {
 const server = http.createServer(async (request, response) => {
   try {
     if (!isLocalRequest(request)) return json(response, 403, { error: "Forbidden." });
-    const url = new URL(request.url ?? "/", "http://localhost");
+    let url;
+    try {
+      url = new URL(request.url ?? "/", "http://localhost");
+    } catch {
+      return json(response, 400, { error: "Malformed request." });
+    }
     if (url.pathname === "/api/health") return json(response, 200, { ok: true });
     if (url.pathname === "/api/dashboard") return json(response, 200, await dashboard(url));
     if (url.pathname.startsWith("/api/")) return json(response, 404, { error: "Not found." });
-    const relative = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+    let relative;
+    try {
+      relative = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+    } catch {
+      return json(response, 400, { error: "Malformed path." });
+    }
     const file = path.resolve(publicDir, `.${relative}`);
     if (!file.startsWith(publicDir + path.sep) || !fs.statSync(file, { throwIfNoEntry: false })?.isFile()) {
       return json(response, 404, { error: "Not found." });
@@ -101,7 +111,10 @@ const server = http.createServer(async (request, response) => {
       "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
       "X-Content-Type-Options": "nosniff",
     });
-    fs.createReadStream(file).pipe(response);
+    // pipe() does not forward read errors; a file swapped out mid-request would otherwise crash the server.
+    fs.createReadStream(file)
+      .on("error", () => response.destroy())
+      .pipe(response);
   } catch (error) {
     json(response, 500, { error: safeError(error) });
   }
