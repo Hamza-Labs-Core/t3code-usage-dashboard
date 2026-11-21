@@ -41,10 +41,142 @@ export function readT3Usage() {
   const file = path.join(config.t3Userdata, "usage-scan-cache-v17.json");
   const info = stat(file);
   const memoKey = info ? `${info.mtimeMs}:${info.size}` : null;
-  if (memoKey && t3UsageMemo?.key === memoKey) return t3UsageMemo.value;
-  const value = decodeT3Usage(file, info);
-  t3UsageMemo = memoKey && value.source.status !== "failed" ? { key: memoKey, value } : null;
-  return value;
+  let value;
+  if (memoKey && t3UsageMemo?.key === memoKey) {
+    value = t3UsageMemo.value;
+  } else {
+    value = decodeT3Usage(file, info);
+    t3UsageMemo = memoKey && value.source.status !== "failed" ? { key: memoKey, value } : null;
+  }
+  if (!value.scanned) return value;
+  // T3 saves this cache only now and then, but its Usage page reads live transcripts.
+  // Read what Claude wrote after the last save so both show the same numbers.
+  const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs);
+  if (unsaved.length === 0) return value;
+  return {
+    records: [...value.records, ...unsaved],
+    source: { ...value.source, records: value.source.records + unsaved.length, unsavedRecords: unsaved.length },
+  };
+}
+
+const claudeTailMemo = new Map();
+let claudeListing = null;
+const LISTING_TTL_MS = 15000;
+
+function readUnsavedClaudeUsage(scanned, dirs, savedAtMs) {
+  const records = [];
+  const live = new Set();
+  for (const [file, scannedSize] of scanned) {
+    const info = stat(file);
+    if (info && info.size > scannedSize) {
+      live.add(file);
+      records.push(...claudeTail(file, scannedSize, info.size));
+    }
+  }
+  // New transcripts started after the save are not in the cache at all.
+  for (const file of listClaudeTranscripts(dirs)) {
+    if (scanned.has(file)) continue;
+    const info = stat(file);
+    if (!info || info.mtimeMs < savedAtMs - 60000) continue;
+    live.add(file);
+    records.push(...claudeTail(file, 0, info.size));
+  }
+  for (const file of claudeTailMemo.keys()) if (!live.has(file)) claudeTailMemo.delete(file);
+  return records;
+}
+
+function listClaudeTranscripts(dirs) {
+  const key = dirs.join("\0");
+  if (claudeListing?.key === key && Date.now() - claudeListing.at < LISTING_TTL_MS) return claudeListing.files;
+  const files = [];
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir, { recursive: true });
+    } catch {
+      continue;
+    }
+    for (const name of names) if (String(name).endsWith(".jsonl")) files.push(path.join(dir, String(name)));
+  }
+  claudeListing = { key, at: Date.now(), files };
+  return files;
+}
+
+function claudeTail(file, from, size) {
+  const held = claudeTailMemo.get(file);
+  if (held?.from === from && held.size === size) return held.records;
+  let text;
+  try {
+    const handle = fs.openSync(file, "r");
+    try {
+      const buffer = Buffer.alloc(size - from);
+      fs.readSync(handle, buffer, 0, buffer.length, from);
+      text = buffer.toString("utf8");
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    return [];
+  }
+  const lines = text.split("\n");
+  // A half-written last line is read again once Claude finishes it.
+  lines.pop();
+  const records = [];
+  for (const line of lines) if (line.includes('"usage"')) records.push(...parseClaudeLine(line));
+  claudeTailMemo.set(file, { from, size, records });
+  return records;
+}
+
+function tokenCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+
+// Mirrors T3's parseClaudeLine (apps/server/src/provider/Drivers/claudeUsage.ts).
+function parseClaudeLine(line) {
+  let record;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  const message = record?.message;
+  const usage = message?.usage;
+  if (record?.type !== "assistant" || typeof usage !== "object" || usage === null) return [];
+  const timestampMs = Date.parse(record.timestamp);
+  const model = typeof message.model === "string" ? message.model : "";
+  if (!Number.isFinite(timestampMs) || !model || model === "<synthetic>") return [];
+  const messageId = typeof message.id === "string" ? message.id : null;
+  const requestId = typeof record.requestId === "string" ? record.requestId : null;
+  const dedupeKey = messageId === null && requestId === null ? null : `${messageId ?? ""}:${requestId ?? ""}`;
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : "";
+  const speed = usage.speed === "fast" ? "fast" : "standard";
+  const toRecord = (source, recordModel, key, reportedCostUsd) => ({
+    provider: "claude",
+    timestampMs,
+    model: recordModel,
+    sessionId,
+    totals: {
+      uncachedInputTokens: tokenCount(source.input_tokens),
+      cachedInputTokens: tokenCount(source.cache_read_input_tokens),
+      cacheCreationTokens: tokenCount(source.cache_creation_input_tokens),
+      outputTokens: tokenCount(source.output_tokens),
+      reasoningTokens: 0,
+    },
+    cacheCreation1hTokens: tokenCount(source.cache_creation?.ephemeral_1h_input_tokens),
+    reportedCostUsd,
+    speed,
+    dedupeKey: key,
+  });
+  const cost = typeof record.costUSD === "number" && Number.isFinite(record.costUSD) ? record.costUSD : null;
+  const records = [toRecord(usage, model, dedupeKey, cost)];
+  // Advisor calls run on another model and appear only in `iterations`.
+  for (const [index, iteration] of (Array.isArray(usage.iterations) ? usage.iterations : []).entries()) {
+    if (iteration?.type !== "advisor_message") continue;
+    const advisorModel = typeof iteration.model === "string" ? iteration.model : "";
+    if (!advisorModel || advisorModel === "<synthetic>") continue;
+    records.push(toRecord(iteration, advisorModel, dedupeKey === null ? null : `${dedupeKey}:advisor:${index}`, null));
+  }
+  return records;
 }
 
 function decodeT3Usage(file, info) {
@@ -63,13 +195,18 @@ function decodeT3Usage(file, info) {
   }
   const records = [];
   const providers = {};
+  const scanned = new Map();
+  const claudeDirs = Object.entries(document.sources ?? {})
+    .filter(([key, value]) => key.startsWith("claude\0") && typeof value?.dir === "string")
+    .map(([, value]) => value.dir);
   let malformedFiles = 0;
-  for (const entry of Object.values(document.files ?? {})) {
+  for (const [file, entry] of Object.entries(document.files ?? {})) {
     if (!entry || !Array.isArray(entry.r) || !Array.isArray(entry.t) || !entry.p) {
       malformedFiles += 1;
       continue;
     }
     const provider = entry.p;
+    if (provider === "claude" && Number.isFinite(entry.s)) scanned.set(file, entry.s);
     providers[provider] ??= { files: 0, records: 0 };
     providers[provider].files += 1;
     for (const row of [...entry.r, ...entry.t]) {
@@ -80,6 +217,8 @@ function decodeT3Usage(file, info) {
   }
   return {
     records,
+    scanned,
+    claudeDirs,
     source: {
       id: "t3-cache",
       label: "T3 supported providers",
