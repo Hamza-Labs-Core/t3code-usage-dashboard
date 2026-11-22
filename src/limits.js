@@ -168,13 +168,28 @@ function zaiWindows(body) {
   return windows;
 }
 
+// T3 keeps a sensitive provider variable out of settings.json ("valueRedacted": true) and stores
+// it in its secret store instead (ServerSecretStore.ts). Read-only; never written or logged.
+function readT3ProviderSecret(instanceId, variable) {
+  const encode = (value) => Buffer.from(value, "utf8").toString("base64url");
+  const file = path.join(config.t3Userdata, "secrets", `provider-env-${encode(instanceId)}-${encode(variable)}.bin`);
+  try {
+    return fs.readFileSync(file, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function readZaiLimits(settings) {
   const found = instanceEntries(settings, new Set(["glm-acp-agent"]));
   const instance = found[0]?.[1];
   const environment = { ...instanceEnvironment(instance), ...process.env };
   const base = environment.ACP_GLM_BASE_URL ?? "https://api.z.ai/api/coding/paas/v4";
   const credentialsFile = path.join(environment.XDG_CONFIG_HOME ?? path.join(config.home, ".config"), "glm-acp-agent", "credentials.json");
-  const key = environment.Z_AI_API_KEY || readJson(credentialsFile)?.z_ai_api_key;
+  const key =
+    environment.Z_AI_API_KEY ||
+    readJson(credentialsFile)?.z_ai_api_key ||
+    (found[0] ? readT3ProviderSecret(found[0][0], "Z_AI_API_KEY") : null);
   let host = "";
   try {
     host = new URL(base).hostname;
