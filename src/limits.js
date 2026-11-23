@@ -171,7 +171,7 @@ function zaiWindows(body) {
 
 // T3 keeps a sensitive provider variable out of settings.json ("valueRedacted": true) and stores
 // it in its secret store instead (ServerSecretStore.ts). Read-only; never written or logged.
-function readT3ProviderSecret(instanceId, variable) {
+export function readT3ProviderSecret(instanceId, variable) {
   const encode = (value) => Buffer.from(value, "utf8").toString("base64url");
   const file = path.join(config.t3Userdata, "secrets", `provider-env-${encode(instanceId)}-${encode(variable)}.bin`);
   try {
@@ -351,11 +351,18 @@ function withLastGood(results) {
 
 let customCache = null;
 let refreshing = null;
+let forcedInFlight = null;
 let fetchGeneration = 0;
+
+export function knownLimitAccountIds() {
+  const ids = new Set(["zai-live", "kimi-live"]);
+  for (const account of readT3Limits()) ids.add(account.id);
+  return ids;
+}
 
 function mergeLimits(custom, settings) {
   const merged = [...readT3Limits(), ...custom].sort((a, b) => a.label.localeCompare(b.label));
-  return attachRenewals(merged, settings);
+  return attachRenewals(merged, settings, readT3ProviderSecret);
 }
 
 // Usage requests must not wait on quota APIs (each can take up to 10s): serve the last reading
@@ -373,7 +380,8 @@ export async function readLimits(settings, force = false) {
     const custom = await refreshing;
     return mergeLimits(custom ?? customCache?.value ?? await fetchCustomLimits(settings), settings);
   }
-  return mergeLimits(await fetchCustomLimits(settings), settings);
+  forcedInFlight ??= fetchCustomLimits(settings).finally(() => { forcedInFlight = null; });
+  return mergeLimits(await forcedInFlight, settings);
 }
 
 async function fetchCustomLimits(settings) {

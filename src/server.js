@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readKimiUsage, readPricing, readT3Settings, readT3Usage, readZaiUsage } from "./collectors.js";
-import { readLimits } from "./limits.js";
+import { knownLimitAccountIds, readLimits } from "./limits.js";
 import { saveRenewalOverride } from "./renewals.js";
 import { aggregateRecords } from "./usage.js";
 import { safeError } from "./util.js";
@@ -62,27 +62,48 @@ async function dashboard(url) {
   };
 }
 
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
 function readJsonBody(request, maxBytes = 16384) {
+  const contentType = String(request.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+  if (contentType && contentType !== "application/json") {
+    return Promise.reject(new HttpError(415, "Content-Type must be application/json."));
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
     request.on("data", (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > maxBytes) {
-        reject(new Error("Request body too large."));
-        request.destroy();
+        settled = true;
+        request.pause();
+        reject(new HttpError(413, "Request body too large."));
         return;
       }
       chunks.push(chunk);
     });
     request.on("end", () => {
+      if (settled) return;
+      settled = true;
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
       } catch {
-        reject(new Error("Invalid JSON body."));
+        reject(new HttpError(400, "Invalid JSON body."));
       }
     });
-    request.on("error", reject);
+    request.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
   });
 }
 
@@ -125,7 +146,7 @@ const server = http.createServer(async (request, response) => {
     }
     if (url.pathname === "/api/renewals" && request.method === "PUT") {
       const body = await readJsonBody(request);
-      saveRenewalOverride(body?.accountId, { date: body?.date, cadence: body?.cadence });
+      saveRenewalOverride(body?.accountId, { date: body?.date, cadence: body?.cadence }, knownLimitAccountIds());
       return json(response, 200, { limits: await readLimits(readT3Settings(), false), readAt: new Date().toISOString() });
     }
     if (url.pathname.startsWith("/api/")) return json(response, 404, { error: "Not found." });
@@ -150,7 +171,9 @@ const server = http.createServer(async (request, response) => {
       .on("error", () => response.destroy())
       .pipe(response);
   } catch (error) {
-    json(response, 500, { error: safeError(error) });
+    const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
+    if (!response.headersSent) json(response, status, { error: safeError(error) });
+    if (status === 413) request.destroy();
   }
 });
 

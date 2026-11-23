@@ -58,6 +58,7 @@ const state = {
   loading: false,
   requestId: 0,
   editingRenewal: null,
+  savingRenewal: false,
 };
 
 function windowBounds(days = state.days) {
@@ -95,6 +96,8 @@ const periodCache = new Map();
 const PERIOD_TTL_MS = 60000;
 const REQUEST_TIMEOUT_MS = 25000;
 let cacheEpoch = 0;
+let limitsVersion = 0;
+let renewalSaveId = 0;
 let lastLimitsAt = 0;
 let foregroundController = null;
 let prefetchController = null;
@@ -106,7 +109,7 @@ function setLoading(loading) {
   syncControls();
 }
 
-async function fetchJsonWithTimeout(url, parentSignal) {
+async function fetchJsonWithTimeout(url, parentSignal, options = {}) {
   const controller = new AbortController();
   let timedOut = false;
   const onParentAbort = () => controller.abort(parentSignal.reason);
@@ -119,7 +122,7 @@ async function fetchJsonWithTimeout(url, parentSignal) {
     controller.abort();
   }, REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    const response = await fetch(url, { ...options, signal: controller.signal, cache: "no-store" });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error ?? "Could not read usage.");
     return body;
@@ -134,13 +137,18 @@ async function fetchJsonWithTimeout(url, parentSignal) {
 
 async function fetchPeriod(days, { force = false, signal, epoch = cacheEpoch } = {}) {
   const startedAt = Date.now();
+  const startedLimitsVersion = limitsVersion;
   const query = new URLSearchParams({ ...windowBounds(days), timeZone });
   if (force) query.set("refresh", "1");
-  const body = await fetchJsonWithTimeout(`/api/dashboard?${query}`, signal);
+  const raw = await fetchJsonWithTimeout(`/api/dashboard?${query}`, signal);
+  // Never let an older in-flight dashboard response revert a newer renewal save.
+  const body = startedLimitsVersion !== limitsVersion && state.data?.limits
+    ? { ...raw, limits: state.data.limits }
+    : raw;
   if (epoch === cacheEpoch) {
     const held = periodCache.get(days);
     if (!held || held.startedAt <= startedAt) periodCache.set(days, { data: body, at: Date.now(), startedAt });
-    lastLimitsAt = Math.max(lastLimitsAt, Date.now());
+    if (startedLimitsVersion === limitsVersion) lastLimitsAt = Math.max(lastLimitsAt, Date.now());
   }
   return body;
 }
@@ -168,19 +176,20 @@ async function prefetchOtherPeriods() {
   }
 }
 
-function applyLimits(limits) {
+function applyLimits(limits, { updateTimestamp = true } = {}) {
   if (!state.data) return;
   state.data = { ...state.data, limits };
   for (const [days, held] of periodCache) {
     periodCache.set(days, { ...held, data: { ...held.data, limits } });
   }
-  lastLimitsAt = Date.now();
-  renderNotices();
+  if (updateTimestamp) lastLimitsAt = Date.now();
+  if (state.metric === "limits") renderNotices();
   renderLimits();
 }
 
 async function refreshLimits({ force = true, showLoading = true } = {}) {
   if (!state.data) return load(force);
+  const startedLimitsVersion = limitsVersion;
   if (showLoading) {
     const requestId = ++state.requestId;
     foregroundController?.abort();
@@ -191,7 +200,7 @@ async function refreshLimits({ force = true, showLoading = true } = {}) {
     setLoading(true);
     try {
       const body = await fetchJsonWithTimeout(`/api/limits${force ? "?refresh=1" : ""}`, controller.signal);
-      if (requestId !== state.requestId) return;
+      if (requestId !== state.requestId || startedLimitsVersion !== limitsVersion) return;
       applyLimits(body.limits);
     } catch (error) {
       if (requestId !== state.requestId || controller.signal.aborted) return;
@@ -211,7 +220,7 @@ async function refreshLimits({ force = true, showLoading = true } = {}) {
   const requestId = state.requestId;
   try {
     const body = await fetchJsonWithTimeout(`/api/limits${force ? "?refresh=1" : ""}`, controller.signal);
-    if (controller.signal.aborted || requestId !== state.requestId) return;
+    if (controller.signal.aborted || requestId !== state.requestId || startedLimitsVersion !== limitsVersion) return;
     applyLimits(body.limits);
   } catch {
     // Silent background poll; manual refresh surfaces errors.
@@ -654,7 +663,7 @@ function renewalDetails(renewal, now) {
     dateLabel = dayShort.format(noon);
     fullDate = dateMedium.format(noon);
     daysLeft = Math.round((localMid - todayMid) / 86400000);
-    inputDate = renewal.anchorDate ?? renewal.date;
+    inputDate = renewal.date;
     countdown = daysLeft < 0 ? `${Math.abs(daysLeft)}d ago` : daysLeft === 0 ? "today" : daysLeft === 1 ? "tomorrow" : `in ${daysLeft}d`;
   } else if (renewal.nextAt) {
     const ms = Date.parse(renewal.nextAt);
@@ -682,8 +691,10 @@ function renewalDetails(renewal, now) {
   }
 
   const prefix = renewal.estimated ? "~" : "";
-  const verb = renewal.cadence === "none" ? "Ends" : "Renews";
-  const soon = daysLeft !== null && daysLeft >= 0 && daysLeft <= 5;
+  const ended = renewal.cadence === "none" && daysLeft !== null && daysLeft < 0;
+  const verb = renewal.verb ?? (ended ? "Ended" : renewal.cadence === "none" ? "Ends" : "Renews");
+  const soon = !ended && daysLeft !== null && daysLeft >= 0 && daysLeft <= 5;
+  const sortGroup = ended ? 1 : 0;
   const tip = [
     `${verb} ${prefix}${fullDate} (${countdown})`,
     renewal.basis ?? null,
@@ -691,33 +702,36 @@ function renewalDetails(renewal, now) {
   ].filter(Boolean).join("\n");
 
   return {
+    sortGroup,
     sortMs,
     dateLabel: `${prefix}${dateLabel}`,
     fullDate,
     daysLeft,
-    countdown,
+    countdown: ended ? "Ended" : countdown,
     inputDate,
     cadence: renewal.cadence ?? "monthly",
-    cadenceLabel: CADENCE_LABELS[renewal.cadence] ?? "Monthly",
+    cadenceLabel: ended ? "Ended" : renewal.cadence ? (CADENCE_LABELS[renewal.cadence] ?? "—") : "—",
     verb,
     soon,
+    ended,
     estimated: Boolean(renewal.estimated),
     hasOverride: Boolean(renewal.hasOverride),
     tip,
   };
 }
 
-function renderRenewalEditor(account, info) {
-  const defaultDate = info?.inputDate ?? dayKey.format(new Date(Date.now() + 30 * 86400000));
-  const defaultCadence = info?.cadence ?? "monthly";
+function renderRenewalEditor(account, info, draft = null) {
+  const defaultDate = draft?.date ?? info?.inputDate ?? dayKey.format(new Date(Date.now() + 30 * 86400000));
+  const defaultCadence = draft?.cadence ?? info?.cadence ?? "monthly";
+  const disabled = state.savingRenewal ? " disabled" : "";
   return `<form class="renewal-form" data-renewal-form="${escapeHtml(account.id)}">
     <label class="renewal-field">
       <span>Next cycle</span>
-      <input type="date" name="date" value="${escapeHtml(defaultDate)}" required>
+      <input type="date" name="date" value="${escapeHtml(defaultDate)}" required${disabled}>
     </label>
     <label class="renewal-field">
       <span>Cadence</span>
-      <select name="cadence">
+      <select name="cadence"${disabled}>
         <option value="monthly"${defaultCadence === "monthly" ? " selected" : ""}>Monthly</option>
         <option value="quarterly"${defaultCadence === "quarterly" ? " selected" : ""}>Quarterly</option>
         <option value="annual"${defaultCadence === "annual" ? " selected" : ""}>Annual</option>
@@ -725,43 +739,47 @@ function renderRenewalEditor(account, info) {
       </select>
     </label>
     <div class="renewal-form-actions">
-      <button type="submit" class="btn-small primary">Save</button>
-      ${info?.hasOverride ? `<button type="button" class="btn-small" data-renewal-clear="${escapeHtml(account.id)}">Reset</button>` : ""}
-      <button type="button" class="btn-small" data-renewal-cancel>Cancel</button>
+      <button type="submit" class="btn-small primary"${disabled}>${state.savingRenewal ? "Saving…" : "Save"}</button>
+      ${info?.hasOverride ? `<button type="button" class="btn-small" data-renewal-clear="${escapeHtml(account.id)}"${disabled}>Reset</button>` : ""}
+      <button type="button" class="btn-small" data-renewal-cancel${disabled}>Cancel</button>
     </div>
   </form>`;
 }
 
-function renderRenewalsSection(accounts, now) {
+function renderRenewalsSection(accounts, now, draft) {
   const rows = accounts
     .map((account) => ({ account, info: renewalDetails(account.renewal, now) }))
-    .sort((a, b) => (a.info?.sortMs ?? Infinity) - (b.info?.sortMs ?? Infinity) || a.account.label.localeCompare(b.account.label));
+    .sort((a, b) =>
+      (a.info?.sortGroup ?? 2) - (b.info?.sortGroup ?? 2) ||
+      (a.info?.sortMs ?? Infinity) - (b.info?.sortMs ?? Infinity) ||
+      a.account.label.localeCompare(b.account.label),
+    );
 
   const body = rows.map(({ account, info }) => {
     const color = providerColor(account.provider);
     const link = account.externalUsage?.url ? safeLink(account.externalUsage.url) : null;
     const editing = state.editingRenewal === account.id;
     const dateCell = info
-      ? `<span class="${info.soon ? "renewal-soon" : "fg"}" data-tip="${escapeHtml(info.tip)}">${escapeHtml(info.dateLabel)}</span>`
+      ? `<span class="${info.soon ? "renewal-soon" : info.ended ? "muted" : "fg"}" data-tip="${escapeHtml(info.tip)}">${escapeHtml(info.dateLabel)}</span>`
       : '<span class="muted">Not set</span>';
     const countdownCell = info
-      ? `<span class="${info.soon ? "renewal-soon" : ""}">${escapeHtml(info.countdown)}</span>`
+      ? `<span class="${info.soon ? "renewal-soon" : info.ended ? "muted" : ""}">${escapeHtml(info.countdown)}</span>`
       : '<span class="muted">—</span>';
     const cadenceCell = info
       ? `<span class="muted">${escapeHtml(info.cadenceLabel)}${info.estimated ? " · est." : ""}</span>`
       : '<span class="muted">—</span>';
     const editorRow = editing
-      ? `<tr class="renewal-editor-row"><td colspan="5">${renderRenewalEditor(account, info)}</td></tr>`
+      ? `<tr class="renewal-editor-row"><td colspan="5">${renderRenewalEditor(account, info, draft?.accountId === account.id ? draft : null)}</td></tr>`
       : "";
     return `<tr>
       <td class="left"><div class="model-cell"><span class="dot" style="background:${color}"></span>${escapeHtml(account.label)}</div></td>
       <td class="figure">${dateCell}</td>
       <td class="figure">${countdownCell}</td>
       <td class="hide-sm">${cadenceCell}</td>
-      <td class="renewal-actions">
+      <td class="renewal-actions"><div class="renewal-actions-inner">
         <button type="button" class="link-btn" data-renewal-edit="${escapeHtml(account.id)}">${info ? "Edit" : "Set"}</button>
         ${link ? `<a class="account-link" href="${escapeHtml(link)}" target="_blank" rel="noreferrer">Manage ↗</a>` : ""}
-      </td>
+      </div></td>
     </tr>${editorRow}`;
   }).join("");
 
@@ -780,19 +798,46 @@ function renderRenewalsSection(accounts, now) {
 }
 
 async function saveRenewal(accountId, { date, cadence }) {
+  if (state.savingRenewal) return;
+  const saveId = ++renewalSaveId;
+  state.savingRenewal = true;
+  prefetchController?.abort();
+  backgroundLimitsController?.abort();
+  renderLimits();
   try {
-    const response = await fetch("/api/renewals", {
+    const body = await fetchJsonWithTimeout("/api/renewals", null, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ accountId, date, cadence }),
     });
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.error ?? "Could not save renewal date.");
-    state.editingRenewal = null;
-    applyLimits(body.limits);
+    if (saveId !== renewalSaveId) return;
+    limitsVersion += 1;
+    state.savingRenewal = false;
+    if (state.editingRenewal === accountId) state.editingRenewal = null;
+    applyLimits(body.limits, { updateTimestamp: false });
   } catch (error) {
+    if (saveId !== renewalSaveId) return;
+    state.savingRenewal = false;
+    renderLimits();
     $("notices").innerHTML = `<p class="notice error">${escapeHtml(error.message)}</p>`;
   }
+}
+
+function captureRenewalDraft() {
+  if (!state.editingRenewal) return null;
+  const form = $("limitsView").querySelector(`[data-renewal-form="${CSS.escape(state.editingRenewal)}"]`);
+  if (!form) return null;
+  const dateInput = form.querySelector('input[name="date"]');
+  const cadenceSelect = form.querySelector('select[name="cadence"]');
+  const focusedName =
+    document.activeElement === dateInput ? "date" :
+    document.activeElement === cadenceSelect ? "cadence" : null;
+  return {
+    accountId: state.editingRenewal,
+    date: dateInput?.value ?? null,
+    cadence: cadenceSelect?.value ?? null,
+    focusedName,
+  };
 }
 
 function renderLimits() {
@@ -802,7 +847,8 @@ function renderLimits() {
     $("limitsView").innerHTML = '<p class="muted">No provider reports limits.</p>';
     return;
   }
-  const renewalsSummary = renderRenewalsSection(accounts, now);
+  const draft = captureRenewalDraft();
+  const renewalsSummary = renderRenewalsSection(accounts, now, draft);
   $("limitsView").innerHTML = `${renewalsSummary}<div class="limits">${accounts.map((account) => {
     const color = providerColor(account.provider);
     const link = account.externalUsage?.url ? safeLink(account.externalUsage.url) : null;
@@ -847,6 +893,9 @@ function renderLimits() {
       ${windows}
     </section>`;
   }).join("")}</div>`;
+  if (draft?.focusedName && state.editingRenewal === draft.accountId && !state.savingRenewal) {
+    $("limitsView").querySelector(`[data-renewal-form="${CSS.escape(draft.accountId)}"] [name="${draft.focusedName}"]`)?.focus();
+  }
 }
 
 /* ---------- Tooltips ---------- */
@@ -904,7 +953,7 @@ for (const button of document.querySelectorAll("[data-metric]")) {
     if (!state.data) {
       if (!state.loading) load();
     } else if (state.metric === "limits") {
-      if (Date.now() - lastLimitsAt >= PERIOD_TTL_MS) refreshLimits({ force: true, showLoading: true });
+      if (!state.editingRenewal && Date.now() - lastLimitsAt >= PERIOD_TTL_MS) refreshLimits({ force: true, showLoading: true });
     } else {
       const held = periodCache.get(state.days);
       if (!held || Date.now() - held.at >= PERIOD_TTL_MS) load();
@@ -964,10 +1013,16 @@ setInterval(() => {
     refreshLimits({ force: true, showLoading: false });
   }
 }, 15000);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.editingRenewal && !state.savingRenewal) {
+    state.editingRenewal = null;
+    renderLimits();
+  }
+});
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || state.loading || !state.data) return;
   if (state.metric === "limits") {
-    if (Date.now() - lastLimitsAt >= PERIOD_TTL_MS) refreshLimits({ force: true, showLoading: false });
+    if (!state.editingRenewal && Date.now() - lastLimitsAt >= PERIOD_TTL_MS) refreshLimits({ force: true, showLoading: false });
   } else {
     const held = periodCache.get(state.days);
     if (!held || Date.now() - held.at >= PERIOD_TTL_MS) load();

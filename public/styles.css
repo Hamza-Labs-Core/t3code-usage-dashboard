@@ -198,7 +198,8 @@ td.wrap { white-space: normal; }
 .windows.stale .fill { opacity: .55; }
 
 /* Renewals */
-.renewals-table td.renewal-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+.renewals-table td.renewal-actions { text-align: right; }
+.renewal-actions-inner { display: inline-flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .renewal-soon { color: #f5a524; font-weight: 500; }
 .link-btn {
   padding: 0; border: 0; background: transparent; color: var(--muted-foreground);
