@@ -5,7 +5,7 @@ A local, read-only dashboard for AI coding usage, cost and plan limits, styled a
 It combines:
 
 - **T3 Code providers** (Claude, Codex, OpenCode, …) from T3's usage scan cache and cached plan limits
-- **Z.ai / GLM** usage from T3's database, and live limits when `Z_AI_API_KEY` is set
+- **Z.ai / GLM** usage from T3's database, and live limits using the key you saved in T3 (or `Z_AI_API_KEY`)
 - **Kimi Code** usage from its session logs, priced at Moonshot API rates, and live limits from Kimi's stored sign-in
 
 Costs are API-price estimates from T3's cached rate table (plus any price overrides and model aliases set in T3), not your subscription bill.
