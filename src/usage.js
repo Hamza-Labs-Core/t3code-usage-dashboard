@@ -340,7 +340,11 @@ export function aggregateRecords(records, options) {
             ? undefined
             : original.provider === "zai"
               ? `zai/${alias}`
-              : original.rateModel,
+              : original.provider === "antigravity" && alias.startsWith("gemini-")
+                ? `gemini/${alias}`
+                : original.provider === "opencode" && alias.startsWith("opencode-go/")
+                  ? `opencode_go/${alias.slice("opencode-go/".length)}`
+                  : undefined,
         }
       : original;
     if (record.dedupeKey) {
@@ -385,36 +389,38 @@ export function aggregateRecords(records, options) {
     point.tokens += recordTokens;
     point.costUsd += priced.costUsd;
 
-    if (record.accountId) {
-      let providerAccounts = accountsByProvider.get(providerKey);
-      if (!providerAccounts) {
-        providerAccounts = new Map();
-        accountsByProvider.set(providerKey, providerAccounts);
-      }
-      if (!providerAccounts.has(record.accountId)) {
-        providerAccounts.set(record.accountId, {
-          id: record.accountId,
-          label: record.accountLabel || record.accountId,
-          provider: providerKey,
-          ...newAggregate(),
-        });
-      }
-      accumulate(providerAccounts.get(record.accountId), record, priced, savings);
-
-      const accTrendKey = `${bucket}\0${providerKey}\0${record.accountId}`;
-      if (!accountTrend.has(accTrendKey)) {
-        accountTrend.set(accTrendKey, {
-          bucket,
-          provider: providerKey,
-          accountId: record.accountId,
-          tokens: 0,
-          costUsd: 0,
-        });
-      }
-      const accPoint = accountTrend.get(accTrendKey);
-      accPoint.tokens += recordTokens;
-      accPoint.costUsd += priced.costUsd;
+    // Always bucket records into an account (using a synthetic "Other" bucket when unattributed)
+    // so multi-account breakdowns and stacked chart bands reconcile 100% with provider totals.
+    const accountId = record.accountId || "__other";
+    const accountLabel = record.accountId ? (record.accountLabel || record.accountId) : "Other";
+    let providerAccounts = accountsByProvider.get(providerKey);
+    if (!providerAccounts) {
+      providerAccounts = new Map();
+      accountsByProvider.set(providerKey, providerAccounts);
     }
+    if (!providerAccounts.has(accountId)) {
+      providerAccounts.set(accountId, {
+        id: accountId,
+        label: accountLabel,
+        provider: providerKey,
+        ...newAggregate(),
+      });
+    }
+    accumulate(providerAccounts.get(accountId), record, priced, savings);
+
+    const accTrendKey = `${bucket}\0${providerKey}\0${accountId}`;
+    if (!accountTrend.has(accTrendKey)) {
+      accountTrend.set(accTrendKey, {
+        bucket,
+        provider: providerKey,
+        accountId,
+        tokens: 0,
+        costUsd: 0,
+      });
+    }
+    const accPoint = accountTrend.get(accTrendKey);
+    accPoint.tokens += recordTokens;
+    accPoint.costUsd += priced.costUsd;
   }
   const finalizeMap = (map) =>
     [...map.values()].map((value) => ({ ...value, ...publicAggregate(value) }));
@@ -424,7 +430,8 @@ export function aggregateRecords(records, options) {
       const accounts = accountMap
         ? finalizeMap(accountMap).sort((a, b) => b.totalTokens - a.totalTokens)
         : [];
-      const multiAccount = accounts.length > 1 || (accounts.length > 0 && multiAccountProviders.has(entry.provider));
+      const hasAttributed = accounts.some((a) => a.id !== "__other");
+      const multiAccount = accounts.length > 1 || (hasAttributed && multiAccountProviders.has(entry.provider));
       return {
         ...entry,
         multiAccount,

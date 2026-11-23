@@ -33,12 +33,12 @@ async function dashboard(url) {
   const settings = readT3Settings();
   const pricing = readPricing(settings);
   const t3 = readT3Usage(settings, force);
-  const skipProviders = new Set(
+  const cachedProviders = new Set(
     Object.entries(t3.source?.providers ?? {})
       .filter(([, counts]) => (counts?.records ?? 0) > 0)
       .map(([provider]) => provider),
   );
-  const t3State = readT3StateUsage(settings, sinceMs, { skipProviders });
+  const t3State = readT3StateUsage(settings, sinceMs, { cachedProviders, cacheMtimeMs: t3.cacheMtimeMs });
   const [kimi, limits] = await Promise.all([readKimiUsage(sinceMs), readLimits(settings, force)]);
   const sources = [t3.source, ...t3State.sources, kimi.source];
   const records = [...t3.records, ...t3State.records, ...kimi.records];

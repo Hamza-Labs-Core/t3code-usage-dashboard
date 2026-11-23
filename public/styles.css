@@ -92,7 +92,7 @@ h2, h3 { margin: 0; font-size: 14px; font-weight: 500; }
 
 .provider { display: flex; flex-direction: column; gap: 4px; }
 .provider-group { gap: 6px; }
-.provider-row { position: relative; display: flex; align-items: flex-start; gap: 4px; margin: 0 -6px; border-radius: 6px; transition: background-color .15s, opacity .15s; }
+.provider-row { display: flex; align-items: center; gap: 4px; margin: 0 -6px; border-radius: 6px; transition: background-color .15s, opacity .15s; }
 .provider-row:hover { background: var(--accent); }
 .provider-toggle {
   flex: 1; min-width: 0; padding: 4px 6px; border: 0; border-radius: 6px;
@@ -102,30 +102,30 @@ h2, h3 { margin: 0; font-size: 14px; font-weight: 500; }
 .provider-toggle:focus-visible, .solo-btn:focus-visible { outline: 2px solid #3b6cf6; outline-offset: 1px; }
 .provider.off > .provider-row > .provider-toggle,
 .nested-row.off > .provider-toggle { opacity: .45; }
-.provider dl { margin: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; width: 100%; }
-.provider dt { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; }
-.provider dd { margin: 0; flex-shrink: 0; font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
-.provider-sub { margin: 0; font-size: 12px; color: var(--muted-foreground); }
+.pr-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; width: 100%; }
+.pr-name { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; }
+.pr-val { flex-shrink: 0; font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.provider-sub { display: block; font-size: 12px; color: var(--muted-foreground); }
 .provider-accounts {
   display: flex; flex-direction: column; gap: 2px;
   margin-left: 9px; padding-left: 12px;
   border-left: 1px solid var(--border);
 }
+.nested-row { margin-left: 0; }
 .nested-toggle { padding: 3px 6px; }
-.nested-toggle dt { font-size: 12px; color: var(--muted-foreground); }
-.nested-toggle dd { font-size: 12px; font-weight: 400; color: var(--muted-foreground); }
-.nested-row:hover .nested-toggle dt, .nested-row:hover .nested-toggle dd { color: var(--foreground); }
+.nested-toggle .pr-name { font-size: 12px; color: var(--muted-foreground); }
+.nested-toggle .pr-val { font-size: 12px; font-weight: 400; color: var(--muted-foreground); }
+.nested-row:hover .nested-toggle .pr-name, .nested-row:hover .nested-toggle .pr-val { color: var(--foreground); }
 .solo-btn {
-  position: absolute; top: 4px; right: 4px;
-  padding: 2px 6px; border: 1px solid var(--input); border-radius: 4px;
+  flex-shrink: 0; margin-right: 4px;
+  padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px;
   background: var(--surface); color: var(--muted-foreground);
   font-size: 10px; line-height: 1.4; cursor: pointer;
   opacity: 0; pointer-events: none; transition: opacity .12s, color .12s, border-color .12s;
 }
-.nested-row .solo-btn { top: 50%; transform: translateY(-50%); }
 .provider-row:hover .solo-btn, .provider-row:focus-within .solo-btn { opacity: 1; pointer-events: auto; }
-.provider-row:hover dd, .provider-row:focus-within dd { opacity: 0; }
-.solo-btn:hover { color: var(--foreground); border-color: var(--foreground); }
+@media (hover: none) { .solo-btn { opacity: .75; pointer-events: auto; } }
+.solo-btn:hover { color: var(--foreground); border-color: var(--input); }
 .sessions { font-size: 11px; color: var(--muted-foreground); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; background: var(--dot-color, currentColor); }
 .dot.sm { width: 7px; height: 7px; }

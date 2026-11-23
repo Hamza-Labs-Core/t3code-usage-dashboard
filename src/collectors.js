@@ -53,20 +53,35 @@ function instanceEnvValue(instanceId, instance, name) {
   return null;
 }
 
+function realpathOrResolve(dir) {
+  const resolved = path.resolve(dir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 function buildAccountResolver(settings) {
   const byProvider = new Map();
   const configuredCount = new Map();
   const addMapping = (provider, dir, id, label) => {
-    if (!dir) return;
-    const normalized = path.resolve(dir);
+    if (!dir) return false;
+    const normalized = realpathOrResolve(dir);
     let list = byProvider.get(provider);
     if (!list) {
       list = [];
       byProvider.set(provider, list);
     }
-    if (!list.some((item) => item.dir === normalized)) {
-      list.push({ dir: normalized, id, label });
+    if (list.some((item) => item.dir === normalized)) return false;
+    list.push({ dir: normalized, id, label });
+    let set = configuredCount.get(provider);
+    if (!set) {
+      set = new Set();
+      configuredCount.set(provider, set);
     }
+    set.add(id);
+    return true;
   };
   const countAccount = (provider, id) => {
     let set = configuredCount.get(provider);
@@ -78,7 +93,7 @@ function buildAccountResolver(settings) {
   };
 
   const instances = settings?.providerInstances ?? {};
-  // Default Claude instance may be omitted from settings.providerInstances.
+  // Default Claude and Codex instances may be omitted from settings.providerInstances.
   const defaultClaude = instances.claudeAgent;
   const defaultClaudeDir =
     expandHome(instanceEnvValue("claudeAgent", defaultClaude, "CLAUDE_CONFIG_DIR")) ??
@@ -86,7 +101,6 @@ function buildAccountResolver(settings) {
     expandHome(process.env.CLAUDE_CONFIG_DIR) ??
     path.join(config.home, ".claude");
   addMapping("claude", defaultClaudeDir, "claudeAgent", defaultClaude?.displayName || "Claude");
-  countAccount("claude", "claudeAgent");
 
   const defaultCodex = instances.codex;
   const defaultCodexDir =
@@ -103,13 +117,11 @@ function buildAccountResolver(settings) {
         expandHome(instanceEnvValue(id, instance, "CLAUDE_CONFIG_DIR")) ??
         expandHome(instance.config?.homePath);
       addMapping("claude", dir, id, instance.displayName || id);
-      countAccount("claude", id);
     } else if (instance.driver === "codex") {
       const dir =
         expandHome(instanceEnvValue(id, instance, "CODEX_HOME")) ??
         expandHome(instance.config?.homePath);
       addMapping("codex", dir, id, instance.displayName || id);
-      countAccount("codex", id);
     } else if (instance.driver === "acpRegistry" && instance.config?.agentId === "glm-acp-agent") {
       countAccount("zai", id);
     } else if (instance.driver === "antigravity") {
@@ -132,21 +144,51 @@ function buildAccountResolver(settings) {
     [...byProvider.entries()].map(([provider, list]) => [provider, list.map((item) => [item.dir, item.id, item.label])]),
   );
 
+  const realpathCache = new Map();
+  const canonicalPath = (filePath) => {
+    const dir = path.dirname(filePath);
+    if (!realpathCache.has(dir)) realpathCache.set(dir, realpathOrResolve(dir));
+    return path.join(realpathCache.get(dir), path.basename(filePath));
+  };
+
+  const fallbackRoots = new Map();
+  function fallbackAccount(provider, root, defaultName) {
+    const key = `${provider}\0${root}`;
+    if (fallbackRoots.has(key)) return fallbackRoots.get(key);
+    const base = path.basename(root).replace(/^\.+/, "") || defaultName;
+    const parent = path.basename(path.dirname(root));
+    const existingLabels = new Set([
+      ...(byProvider.get(provider) ?? []).map((item) => item.label.toLowerCase()),
+      ...[...fallbackRoots.values()].filter((v) => v.provider === provider).map((v) => v.accountLabel.toLowerCase()),
+    ]);
+    const label = existingLabels.has(base.toLowerCase()) && parent ? `${base} (${parent})` : base;
+    const entry = { provider, accountId: `${provider}:dir:${root}`, accountLabel: label };
+    fallbackRoots.set(key, entry);
+    return entry;
+  }
+
   function resolve(provider, filePath) {
     const list = byProvider.get(provider);
     if (!list || typeof filePath !== "string") return null;
+    const normalized = canonicalPath(filePath);
     for (const item of list) {
-      if (filePath === item.dir || filePath.startsWith(item.dir + path.sep)) {
+      if (normalized === item.dir || normalized.startsWith(item.dir + path.sep)) {
         return { accountId: item.id, accountLabel: item.label };
       }
     }
     if (provider === "claude") {
       const marker = `${path.sep}projects${path.sep}`;
-      const idx = filePath.indexOf(marker);
+      const idx = normalized.lastIndexOf(marker);
       if (idx > 0) {
-        const root = filePath.slice(0, idx);
-        const name = path.basename(root).replace(/^\.+/, "") || "Claude";
-        return { accountId: `claude:${root}`, accountLabel: name };
+        const entry = fallbackAccount("claude", normalized.slice(0, idx), "Claude");
+        return { accountId: entry.accountId, accountLabel: entry.accountLabel };
+      }
+    } else if (provider === "codex") {
+      const marker = `${path.sep}sessions${path.sep}`;
+      const idx = normalized.lastIndexOf(marker);
+      if (idx > 0) {
+        const entry = fallbackAccount("codex", normalized.slice(0, idx), "Codex");
+        return { accountId: entry.accountId, accountLabel: entry.accountLabel };
       }
     }
     return null;
@@ -172,14 +214,16 @@ export function readT3Usage(settings = {}, force = false) {
   }
   const multiAccountProviders = new Set(resolver.multiAccountProviders);
   if ((value.claudeDirs?.length ?? 0) > 1) multiAccountProviders.add("claude");
-  if (!value.scanned) return { ...value, multiAccountProviders };
+  const cacheMtimeMs = info?.mtimeMs ?? null;
+  if (!value.scanned) return { ...value, multiAccountProviders, cacheMtimeMs };
   // T3 saves this cache only now and then, but its Usage page reads live transcripts.
   // Read what Claude wrote after the last save so both show the same numbers.
   const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs, resolver, force);
-  if (unsaved.length === 0) return { ...value, multiAccountProviders };
+  if (unsaved.length === 0) return { ...value, multiAccountProviders, cacheMtimeMs };
   return {
     records: [...value.records, ...unsaved],
     multiAccountProviders,
+    cacheMtimeMs,
     source: { ...value.source, records: value.source.records + unsaved.length, unsavedRecords: unsaved.length },
   };
 }
@@ -373,8 +417,10 @@ function zaiInstanceIds(settings) {
   return ids;
 }
 
+// Mirrors T3's antigravityRateModel (AntigravityUsage/antigravityUsageReader.ts) and prefixes
+// bare Gemini model IDs to match first-party `gemini/*` entries in usage-model-rates.json.
 function antigravityRateModel(model) {
-  const base = model.replace(/-(?:extra-low|low|medium|high|tiered|control|thinking|agent)$/, "");
+  const base = model.replace(/(?:-(?:extra-low|low|medium|high|tiered|control|thinking|agent))+$/, "");
   const normalized = /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
     ? "gemini-3.5-flash"
     : model === "gemini-3.7-flash-safety-le"
@@ -387,17 +433,18 @@ function antigravityRateModel(model) {
 
 function openCodeRateModel(model) {
   if (model.startsWith("opencode-go/")) return `opencode_go/${model.slice("opencode-go/".length)}`;
+  if (model.startsWith("opencode/")) return model.slice("opencode/".length);
   return undefined;
 }
 
-export function readT3StateUsage(settings, sinceMs = 0, { skipProviders = new Set() } = {}) {
+export function readT3StateUsage(settings, sinceMs = 0, { cachedProviders = new Set(), cacheMtimeMs = null } = {}) {
   const file = path.join(config.t3Userdata, "statev2.sqlite");
   const info = stat(file);
   if (!info) {
     return {
       records: [],
       sources: [
-        { id: "t3-state", label: "Z.ai / Antigravity / OpenCode", status: "missing", message: "T3 state database not found.", updatedAt: null },
+        { id: "t3-state", label: "T3 state database", status: "missing", message: "T3 state database not found.", updatedAt: null },
       ],
     };
   }
@@ -434,25 +481,32 @@ export function readT3StateUsage(settings, sinceMs = 0, { skipProviders = new Se
       let provider = null;
       if (row.driver === "acpRegistry") {
         if (zaiInstances.has(row.instance_id)) provider = "zai";
-      } else if (row.driver === "antigravity" && !skipProviders.has("antigravity")) {
+      } else if (row.driver === "antigravity") {
         provider = "antigravity";
-      } else if (row.driver === "opencode" && !skipProviders.has("opencode")) {
+      } else if (row.driver === "opencode") {
         provider = "opencode";
       }
       if (!provider) continue;
+
+      const happenedAt = timestamp(row.happened_at);
+      // If T3's scan cache already contains records for this provider, only include turns
+      // recorded after the cache file was last written so recent turns appear without double-counting.
+      if (provider !== "zai" && cachedProviders.has(provider)) {
+        if (cacheMtimeMs === null || !happenedAt || happenedAt <= cacheMtimeMs) continue;
+      }
 
       const turn = JSON.parse(row.turn_json);
       const run = row.run_json ? JSON.parse(row.run_json) : {};
       const usage = turn.turnTokenUsage;
       const model = run.modelSelection?.model;
-      const happenedAt = timestamp(row.happened_at);
       if (!model || !happenedAt || !Number.isFinite(usage?.inputTokens) || !Number.isFinite(usage?.outputTokens)) {
         counts[provider].skipped += 1;
         continue;
       }
       const cached = Math.max(0, number(usage.cachedInputTokens));
       const created = Math.max(0, number(usage.cacheCreationTokens));
-      const accountLabel = settings.providerInstances?.[row.instance_id]?.displayName || counts[provider].label;
+      const configuredName = settings.providerInstances?.[row.instance_id]?.displayName;
+      const accountLabel = configuredName || (row.instance_id === provider || row.instance_id === "acpRegistry_glm_agent" ? counts[provider].label : row.instance_id);
       const rateModel =
         provider === "zai"
           ? `zai/${model}`
@@ -495,7 +549,7 @@ export function readT3StateUsage(settings, sinceMs = 0, { skipProviders = new Se
     return {
       records: [],
       sources: [
-        { id: "t3-state", label: "Z.ai / Antigravity / OpenCode", status: "failed", message: safeError(error), updatedAt: info.mtime.toISOString() },
+        { id: "t3-state", label: "T3 state database", status: "failed", message: safeError(error), updatedAt: info.mtime.toISOString() },
       ],
     };
   } finally {
