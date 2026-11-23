@@ -2,7 +2,7 @@ import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { readKimiUsage, readPricing, readT3Settings, readT3Usage, readZaiUsage } from "./collectors.js";
+import { readKimiUsage, readPricing, readT3Settings, readT3StateUsage, readT3Usage } from "./collectors.js";
 import { knownLimitAccountIds, readLimits } from "./limits.js";
 import { saveRenewalOverride } from "./renewals.js";
 import { aggregateRecords } from "./usage.js";
@@ -32,11 +32,16 @@ async function dashboard(url) {
   const force = url.searchParams.get("refresh") === "1";
   const settings = readT3Settings();
   const pricing = readPricing(settings);
-  const t3 = readT3Usage(force);
-  const zai = readZaiUsage(settings, sinceMs);
+  const t3 = readT3Usage(settings, force);
+  const cachedProviders = new Set(
+    Object.entries(t3.source?.providers ?? {})
+      .filter(([, counts]) => (counts?.records ?? 0) > 0)
+      .map(([provider]) => provider),
+  );
+  const t3State = readT3StateUsage(settings, sinceMs, { cachedProviders, cacheMtimeMs: t3.cacheMtimeMs });
   const [kimi, limits] = await Promise.all([readKimiUsage(sinceMs), readLimits(settings, force)]);
-  const sources = [t3.source, zai.source, kimi.source];
-  const records = [...t3.records, ...zai.records, ...kimi.records];
+  const sources = [t3.source, ...t3State.sources, kimi.source];
+  const records = [...t3.records, ...t3State.records, ...kimi.records];
   const usage = aggregateRecords(records, {
     sinceMs,
     untilMs,
@@ -45,6 +50,7 @@ async function dashboard(url) {
     overrides: pricing.overrides,
     aliases: pricing.aliases,
     modelFilter: pricing.modelFilter,
+    multiAccountProviders: t3.multiAccountProviders,
   });
   return {
     ...usage,

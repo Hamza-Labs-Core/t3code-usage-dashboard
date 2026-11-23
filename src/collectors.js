@@ -3,6 +3,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "./config.js";
+import { readT3ProviderSecret } from "./limits.js";
 import {
   decodeCacheRecord,
   overrideRateTable,
@@ -34,27 +35,195 @@ export function readPricing(settings) {
   };
 }
 
+function expandHome(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const trimmed = value.trim();
+  if (trimmed === "~") return config.home;
+  if (trimmed.startsWith("~/")) return path.join(config.home, trimmed.slice(2));
+  return path.resolve(trimmed);
+}
+
+function instanceEnvValue(instanceId, instance, name) {
+  const entries = Array.isArray(instance?.environment) ? instance.environment : [];
+  for (const entry of entries) {
+    if (entry?.name !== name) continue;
+    if (entry.valueRedacted === true) return readT3ProviderSecret(instanceId, name);
+    if (typeof entry.value === "string" && entry.value.trim()) return entry.value;
+  }
+  return null;
+}
+
+function realpathOrResolve(dir) {
+  const resolved = path.resolve(dir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function buildAccountResolver(settings) {
+  const byProvider = new Map();
+  const configuredCount = new Map();
+  const addMapping = (provider, dir, id, label) => {
+    if (!dir) return false;
+    const normalized = realpathOrResolve(dir);
+    let list = byProvider.get(provider);
+    if (!list) {
+      list = [];
+      byProvider.set(provider, list);
+    }
+    if (list.some((item) => item.dir === normalized)) return false;
+    list.push({ dir: normalized, id, label });
+    let set = configuredCount.get(provider);
+    if (!set) {
+      set = new Set();
+      configuredCount.set(provider, set);
+    }
+    set.add(id);
+    return true;
+  };
+  const countAccount = (provider, id) => {
+    let set = configuredCount.get(provider);
+    if (!set) {
+      set = new Set();
+      configuredCount.set(provider, set);
+    }
+    set.add(id);
+  };
+
+  const instances = settings?.providerInstances ?? {};
+  // Default Claude and Codex instances may be omitted from settings.providerInstances.
+  const defaultClaude = instances.claudeAgent;
+  const defaultClaudeDir =
+    expandHome(instanceEnvValue("claudeAgent", defaultClaude, "CLAUDE_CONFIG_DIR")) ??
+    expandHome(defaultClaude?.config?.homePath) ??
+    expandHome(process.env.CLAUDE_CONFIG_DIR) ??
+    path.join(config.home, ".claude");
+  addMapping("claude", defaultClaudeDir, "claudeAgent", defaultClaude?.displayName || "Claude");
+
+  const defaultCodex = instances.codex;
+  const defaultCodexDir =
+    expandHome(instanceEnvValue("codex", defaultCodex, "CODEX_HOME")) ??
+    expandHome(defaultCodex?.config?.homePath) ??
+    expandHome(process.env.CODEX_HOME) ??
+    path.join(config.home, ".codex");
+  addMapping("codex", defaultCodexDir, "codex", defaultCodex?.displayName || "Codex");
+
+  for (const [id, instance] of Object.entries(instances)) {
+    if (!instance || typeof instance !== "object") continue;
+    if (instance.driver === "claudeAgent") {
+      const dir =
+        expandHome(instanceEnvValue(id, instance, "CLAUDE_CONFIG_DIR")) ??
+        expandHome(instance.config?.homePath);
+      addMapping("claude", dir, id, instance.displayName || id);
+    } else if (instance.driver === "codex") {
+      const dir =
+        expandHome(instanceEnvValue(id, instance, "CODEX_HOME")) ??
+        expandHome(instance.config?.homePath);
+      addMapping("codex", dir, id, instance.displayName || id);
+    } else if (instance.driver === "acpRegistry" && instance.config?.agentId === "glm-acp-agent") {
+      countAccount("zai", id);
+    } else if (instance.driver === "antigravity") {
+      countAccount("antigravity", id);
+    } else if (instance.driver === "opencode") {
+      countAccount("opencode", id);
+    }
+  }
+
+  for (const list of byProvider.values()) {
+    list.sort((a, b) => b.dir.length - a.dir.length);
+  }
+
+  const multiAccountProviders = new Set();
+  for (const [provider, ids] of configuredCount) {
+    if (ids.size > 1) multiAccountProviders.add(provider);
+  }
+
+  const signature = JSON.stringify(
+    [...byProvider.entries()].map(([provider, list]) => [provider, list.map((item) => [item.dir, item.id, item.label])]),
+  );
+
+  const realpathCache = new Map();
+  const canonicalPath = (filePath) => {
+    const dir = path.dirname(filePath);
+    if (!realpathCache.has(dir)) realpathCache.set(dir, realpathOrResolve(dir));
+    return path.join(realpathCache.get(dir), path.basename(filePath));
+  };
+
+  const fallbackRoots = new Map();
+  function fallbackAccount(provider, root, defaultName) {
+    const key = `${provider}\0${root}`;
+    if (fallbackRoots.has(key)) return fallbackRoots.get(key);
+    const base = path.basename(root).replace(/^\.+/, "") || defaultName;
+    const parent = path.basename(path.dirname(root));
+    const existingLabels = new Set([
+      ...(byProvider.get(provider) ?? []).map((item) => item.label.toLowerCase()),
+      ...[...fallbackRoots.values()].filter((v) => v.provider === provider).map((v) => v.accountLabel.toLowerCase()),
+    ]);
+    const label = existingLabels.has(base.toLowerCase()) && parent ? `${base} (${parent})` : base;
+    const entry = { provider, accountId: `${provider}:dir:${root}`, accountLabel: label };
+    fallbackRoots.set(key, entry);
+    return entry;
+  }
+
+  function resolve(provider, filePath) {
+    const list = byProvider.get(provider);
+    if (!list || typeof filePath !== "string") return null;
+    const normalized = canonicalPath(filePath);
+    for (const item of list) {
+      if (normalized === item.dir || normalized.startsWith(item.dir + path.sep)) {
+        return { accountId: item.id, accountLabel: item.label };
+      }
+    }
+    if (provider === "claude") {
+      const marker = `${path.sep}projects${path.sep}`;
+      const idx = normalized.lastIndexOf(marker);
+      if (idx > 0) {
+        const entry = fallbackAccount("claude", normalized.slice(0, idx), "Claude");
+        return { accountId: entry.accountId, accountLabel: entry.accountLabel };
+      }
+    } else if (provider === "codex") {
+      const marker = `${path.sep}sessions${path.sep}`;
+      const idx = normalized.lastIndexOf(marker);
+      if (idx > 0) {
+        const entry = fallbackAccount("codex", normalized.slice(0, idx), "Codex");
+        return { accountId: entry.accountId, accountLabel: entry.accountLabel };
+      }
+    }
+    return null;
+  }
+
+  return { resolve, multiAccountProviders, signature };
+}
+
 // T3 rewrites its 46 MB usage cache only when it rescans, so reuse the decode until the file changes.
 let t3UsageMemo = null;
 
-export function readT3Usage(force = false) {
+export function readT3Usage(settings = {}, force = false) {
+  const resolver = buildAccountResolver(settings);
   const file = path.join(config.t3Userdata, "usage-scan-cache-v17.json");
   const info = stat(file);
-  const memoKey = info ? `${info.mtimeMs}:${info.size}` : null;
+  const memoKey = info ? `${info.mtimeMs}:${info.size}:${resolver.signature}` : null;
   let value;
   if (memoKey && t3UsageMemo?.key === memoKey) {
     value = t3UsageMemo.value;
   } else {
-    value = decodeT3Usage(file, info);
+    value = decodeT3Usage(file, info, resolver);
     t3UsageMemo = memoKey && value.source.status !== "failed" ? { key: memoKey, value } : null;
   }
-  if (!value.scanned) return value;
+  const multiAccountProviders = new Set(resolver.multiAccountProviders);
+  if ((value.claudeDirs?.length ?? 0) > 1) multiAccountProviders.add("claude");
+  const cacheMtimeMs = info?.mtimeMs ?? null;
+  if (!value.scanned) return { ...value, multiAccountProviders, cacheMtimeMs };
   // T3 saves this cache only now and then, but its Usage page reads live transcripts.
   // Read what Claude wrote after the last save so both show the same numbers.
-  const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs, force);
-  if (unsaved.length === 0) return value;
+  const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs, resolver, force);
+  if (unsaved.length === 0) return { ...value, multiAccountProviders, cacheMtimeMs };
   return {
     records: [...value.records, ...unsaved],
+    multiAccountProviders,
+    cacheMtimeMs,
     source: { ...value.source, records: value.source.records + unsaved.length, unsavedRecords: unsaved.length },
   };
 }
@@ -63,14 +232,17 @@ const claudeTailMemo = new Map();
 let claudeListing = null;
 const LISTING_TTL_MS = 15000;
 
-function readUnsavedClaudeUsage(scanned, dirs, savedAtMs, force = false) {
+function readUnsavedClaudeUsage(scanned, dirs, savedAtMs, resolver, force = false) {
   const records = [];
   const live = new Set();
   for (const [file, scannedSize] of scanned) {
     const info = stat(file);
     if (info && info.size > scannedSize) {
       live.add(file);
-      records.push(...claudeTail(file, scannedSize, info.size));
+      const account = resolver.resolve("claude", file);
+      for (const record of claudeTail(file, scannedSize, info.size)) {
+        records.push(account ? { ...record, ...account } : record);
+      }
     }
   }
   // New transcripts started after the save are not in the cache at all.
@@ -79,7 +251,10 @@ function readUnsavedClaudeUsage(scanned, dirs, savedAtMs, force = false) {
     const info = stat(file);
     if (!info || info.mtimeMs < savedAtMs - 60000) continue;
     live.add(file);
-    records.push(...claudeTail(file, 0, info.size));
+    const account = resolver.resolve("claude", file);
+    for (const record of claudeTail(file, 0, info.size)) {
+      records.push(account ? { ...record, ...account } : record);
+    }
   }
   for (const file of claudeTailMemo.keys()) if (!live.has(file)) claudeTailMemo.delete(file);
   return records;
@@ -179,7 +354,7 @@ function parseClaudeLine(line) {
   return records;
 }
 
-function decodeT3Usage(file, info) {
+function decodeT3Usage(file, info, resolver) {
   const document = readJson(file);
   if (!document || !Array.isArray(document.models) || !Array.isArray(document.sessions)) {
     return {
@@ -200,18 +375,19 @@ function decodeT3Usage(file, info) {
     .filter(([key, value]) => key.startsWith("claude\0") && typeof value?.dir === "string")
     .map(([, value]) => value.dir);
   let malformedFiles = 0;
-  for (const [file, entry] of Object.entries(document.files ?? {})) {
+  for (const [entryFile, entry] of Object.entries(document.files ?? {})) {
     if (!entry || !Array.isArray(entry.r) || !Array.isArray(entry.t) || !entry.p) {
       malformedFiles += 1;
       continue;
     }
     const provider = entry.p;
-    if (provider === "claude" && Number.isFinite(entry.s)) scanned.set(file, entry.s);
+    if (provider === "claude" && Number.isFinite(entry.s)) scanned.set(entryFile, entry.s);
+    const account = resolver?.resolve(provider, entryFile) ?? null;
     providers[provider] ??= { files: 0, records: 0 };
     providers[provider].files += 1;
     for (const row of [...entry.r, ...entry.t]) {
       const record = decodeCacheRecord(row, provider, document.models, document.sessions, document.version);
-      if (record) records.push(record);
+      if (record) records.push(account ? { ...record, ...account } : record);
     }
     providers[provider].records += entry.r.length + entry.t.length;
   }
@@ -241,13 +417,35 @@ function zaiInstanceIds(settings) {
   return ids;
 }
 
-export function readZaiUsage(settings, sinceMs = 0) {
+// Mirrors T3's antigravityRateModel (AntigravityUsage/antigravityUsageReader.ts) and prefixes
+// bare Gemini model IDs to match first-party `gemini/*` entries in usage-model-rates.json.
+function antigravityRateModel(model) {
+  const base = model.replace(/(?:-(?:extra-low|low|medium|high|tiered|control|thinking|agent))+$/, "");
+  const normalized = /^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$/.test(model)
+    ? "gemini-3.5-flash"
+    : model === "gemini-3.7-flash-safety-le"
+      ? "gemini-3.7-flash"
+      : base === "gemini-3-flash"
+        ? "gemini-3-flash-preview"
+        : base;
+  return normalized.startsWith("gemini-") ? `gemini/${normalized}` : normalized;
+}
+
+function openCodeRateModel(model) {
+  if (model.startsWith("opencode-go/")) return `opencode_go/${model.slice("opencode-go/".length)}`;
+  if (model.startsWith("opencode/")) return model.slice("opencode/".length);
+  return undefined;
+}
+
+export function readT3StateUsage(settings, sinceMs = 0, { cachedProviders = new Set(), cacheMtimeMs = null } = {}) {
   const file = path.join(config.t3Userdata, "statev2.sqlite");
   const info = stat(file);
   if (!info) {
     return {
       records: [],
-      source: { id: "zai", label: "Z.ai / GLM", status: "missing", message: "T3 state database not found.", updatedAt: null },
+      sources: [
+        { id: "t3-state", label: "T3 state database", status: "missing", message: "T3 state database not found.", updatedAt: null },
+      ],
     };
   }
   let db;
@@ -259,6 +457,7 @@ export function readZaiUsage(settings, sinceMs = 0) {
              COALESCE(t.completed_at, t.started_at) AS happened_at,
              t.payload_json AS turn_json,
              r.payload_json AS run_json,
+             th.driver AS driver,
              th.provider_instance_id AS instance_id
       FROM orchestration_v2_projection_provider_turns t
       JOIN orchestration_v2_projection_provider_threads th
@@ -267,31 +466,60 @@ export function readZaiUsage(settings, sinceMs = 0) {
         ON a.attempt_id = t.run_attempt_id
       LEFT JOIN orchestration_v2_projection_runs r
         ON r.run_id = a.run_id
-      WHERE th.driver = 'acpRegistry'
+      WHERE th.driver IN ('acpRegistry', 'antigravity', 'opencode')
         AND json_extract(t.payload_json, '$.turnTokenUsage.usageStatus') IN ('complete', 'partial')
         AND COALESCE(t.completed_at, t.started_at) >= ?
     `).all(new Date(Math.max(0, sinceMs - 36 * 3600000)).toISOString());
-    const instances = zaiInstanceIds(settings);
+    const zaiInstances = zaiInstanceIds(settings);
     const records = [];
-    let skipped = 0;
+    const counts = {
+      zai: { label: "Z.ai / GLM", records: 0, skipped: 0 },
+      antigravity: { label: "Antigravity", records: 0, skipped: 0 },
+      opencode: { label: "OpenCode", records: 0, skipped: 0 },
+    };
     for (const row of rows) {
-      if (!instances.has(row.instance_id)) continue;
+      let provider = null;
+      if (row.driver === "acpRegistry") {
+        if (zaiInstances.has(row.instance_id)) provider = "zai";
+      } else if (row.driver === "antigravity") {
+        provider = "antigravity";
+      } else if (row.driver === "opencode") {
+        provider = "opencode";
+      }
+      if (!provider) continue;
+
+      const happenedAt = timestamp(row.happened_at);
+      // If T3's scan cache already contains records for this provider, only include turns
+      // recorded after the cache file was last written so recent turns appear without double-counting.
+      if (provider !== "zai" && cachedProviders.has(provider)) {
+        if (cacheMtimeMs === null || !happenedAt || happenedAt <= cacheMtimeMs) continue;
+      }
+
       const turn = JSON.parse(row.turn_json);
       const run = row.run_json ? JSON.parse(row.run_json) : {};
       const usage = turn.turnTokenUsage;
       const model = run.modelSelection?.model;
-      const happenedAt = timestamp(row.happened_at);
       if (!model || !happenedAt || !Number.isFinite(usage?.inputTokens) || !Number.isFinite(usage?.outputTokens)) {
-        skipped += 1;
+        counts[provider].skipped += 1;
         continue;
       }
       const cached = Math.max(0, number(usage.cachedInputTokens));
       const created = Math.max(0, number(usage.cacheCreationTokens));
+      const configuredName = settings.providerInstances?.[row.instance_id]?.displayName;
+      const accountLabel = configuredName || (row.instance_id === provider || row.instance_id === "acpRegistry_glm_agent" ? counts[provider].label : row.instance_id);
+      const rateModel =
+        provider === "zai"
+          ? `zai/${model}`
+          : provider === "antigravity"
+            ? antigravityRateModel(model)
+            : openCodeRateModel(model);
       records.push({
-        provider: "zai",
+        provider,
+        accountId: row.instance_id,
+        accountLabel,
         timestampMs: happenedAt,
         model,
-        rateModel: `zai/${model}`,
+        rateModel,
         sessionId: row.session_id,
         totals: {
           uncachedInputTokens: Math.max(0, usage.inputTokens - cached - created),
@@ -302,24 +530,27 @@ export function readZaiUsage(settings, sinceMs = 0) {
         },
         reportedCostUsd: null,
         speed: "standard",
-        dedupeKey: `zai:${row.turn_id}`,
+        dedupeKey: `${provider}:${row.turn_id}`,
       });
+      counts[provider].records += 1;
     }
-    return {
-      records,
-      source: {
-        id: "zai",
-        label: "Z.ai / GLM",
-        status: skipped > 0 ? "partial" : "ok",
-        message: skipped > 0 ? `${skipped} recorded turns lacked a model or complete counters.` : null,
+    const sources = Object.entries(counts)
+      .filter(([id, entry]) => id === "zai" || entry.records > 0 || entry.skipped > 0)
+      .map(([id, entry]) => ({
+        id,
+        label: entry.label,
+        status: entry.skipped > 0 ? "partial" : "ok",
+        message: entry.skipped > 0 ? `${entry.skipped} recorded turns lacked a model or complete counters.` : null,
         updatedAt: info.mtime.toISOString(),
-        records: records.length,
-      },
-    };
+        records: entry.records,
+      }));
+    return { records, sources };
   } catch (error) {
     return {
       records: [],
-      source: { id: "zai", label: "Z.ai / GLM", status: "failed", message: safeError(error), updatedAt: info.mtime.toISOString() },
+      sources: [
+        { id: "t3-state", label: "T3 state database", status: "failed", message: safeError(error), updatedAt: info.mtime.toISOString() },
+      ],
     };
   } finally {
     db?.close();

@@ -319,7 +319,7 @@ function publicAggregate(aggregate) {
 }
 
 export function aggregateRecords(records, options) {
-  const { sinceMs, untilMs, timeZone, rates, overrides, aliases, modelFilter } = options;
+  const { sinceMs, untilMs, timeZone, rates, overrides, aliases, modelFilter, multiAccountProviders = new Set() } = options;
   const toDay = dayFormatter(timeZone);
   const seen = new Map();
   const deduped = [];
@@ -340,7 +340,11 @@ export function aggregateRecords(records, options) {
             ? undefined
             : original.provider === "zai"
               ? `zai/${alias}`
-              : original.rateModel,
+              : original.provider === "antigravity" && alias.startsWith("gemini-")
+                ? `gemini/${alias}`
+                : original.provider === "opencode" && alias.startsWith("opencode-go/")
+                  ? `opencode_go/${alias.slice("opencode-go/".length)}`
+                  : undefined,
         }
       : original;
     if (record.dedupeKey) {
@@ -358,8 +362,10 @@ export function aggregateRecords(records, options) {
   const resolve = rateResolver(rates, overrides);
   const total = newAggregate();
   const providers = new Map();
+  const accountsByProvider = new Map();
   const models = new Map();
   const trend = new Map();
+  const accountTrend = new Map();
   const hourly = untilMs - sinceMs <= 36 * 3600000;
   for (const record of deduped) {
     const rate = resolve(record);
@@ -379,16 +385,69 @@ export function aggregateRecords(records, options) {
     const trendKey = `${bucket}\0${record.provider}`;
     if (!trend.has(trendKey)) trend.set(trendKey, { bucket, provider: record.provider, tokens: 0, costUsd: 0 });
     const point = trend.get(trendKey);
-    point.tokens += totalTokens(record.totals);
+    const recordTokens = totalTokens(record.totals);
+    point.tokens += recordTokens;
     point.costUsd += priced.costUsd;
+
+    // Always bucket records into an account (using a synthetic "Other" bucket when unattributed)
+    // so multi-account breakdowns and stacked chart bands reconcile 100% with provider totals.
+    const accountId = record.accountId || "__other";
+    const accountLabel = record.accountId ? (record.accountLabel || record.accountId) : "Other";
+    let providerAccounts = accountsByProvider.get(providerKey);
+    if (!providerAccounts) {
+      providerAccounts = new Map();
+      accountsByProvider.set(providerKey, providerAccounts);
+    }
+    if (!providerAccounts.has(accountId)) {
+      providerAccounts.set(accountId, {
+        id: accountId,
+        label: accountLabel,
+        provider: providerKey,
+        ...newAggregate(),
+      });
+    }
+    accumulate(providerAccounts.get(accountId), record, priced, savings);
+
+    const accTrendKey = `${bucket}\0${providerKey}\0${accountId}`;
+    if (!accountTrend.has(accTrendKey)) {
+      accountTrend.set(accTrendKey, {
+        bucket,
+        provider: providerKey,
+        accountId,
+        tokens: 0,
+        costUsd: 0,
+      });
+    }
+    const accPoint = accountTrend.get(accTrendKey);
+    accPoint.tokens += recordTokens;
+    accPoint.costUsd += priced.costUsd;
   }
   const finalizeMap = (map) =>
     [...map.values()].map((value) => ({ ...value, ...publicAggregate(value) }));
+  const finalizedProviders = finalizeMap(providers)
+    .map((entry) => {
+      const accountMap = accountsByProvider.get(entry.provider);
+      const accounts = accountMap
+        ? finalizeMap(accountMap).sort((a, b) => b.totalTokens - a.totalTokens)
+        : [];
+      const hasAttributed = accounts.some((a) => a.id !== "__other");
+      const multiAccount = accounts.length > 1 || (hasAttributed && multiAccountProviders.has(entry.provider));
+      return {
+        ...entry,
+        multiAccount,
+        accounts: multiAccount ? accounts : [],
+      };
+    })
+    .sort((a, b) => b.totalTokens - a.totalTokens);
+  const multiProviderSet = new Set(finalizedProviders.filter((p) => p.multiAccount).map((p) => p.provider));
   return {
     summary: publicAggregate(total),
-    providers: finalizeMap(providers).sort((a, b) => b.totalTokens - a.totalTokens),
+    providers: finalizedProviders,
     models: finalizeMap(models).sort((a, b) => b.totalTokens - a.totalTokens),
     trend: [...trend.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)),
+    accountTrend: [...accountTrend.values()]
+      .filter((point) => multiProviderSet.has(point.provider))
+      .sort((a, b) => a.bucket.localeCompare(b.bucket)),
     duplicatesDropped,
     records: deduped.length,
   };
