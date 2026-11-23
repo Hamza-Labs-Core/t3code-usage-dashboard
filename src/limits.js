@@ -3,6 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import * as Toml from "smol-toml";
 import { config } from "./config.js";
+import { attachRenewals } from "./renewals.js";
 import { clampPercent, isoDate, readJson } from "./util.js";
 
 const KIMI_DEFAULT_OAUTH = "https://auth.kimi.com";
@@ -348,34 +349,42 @@ function withLastGood(results) {
   return value;
 }
 
-let cache = null;
+let customCache = null;
 let refreshing = null;
+let fetchGeneration = 0;
+
+function mergeLimits(custom, settings) {
+  const merged = [...readT3Limits(), ...custom].sort((a, b) => a.label.localeCompare(b.label));
+  return attachRenewals(merged, settings);
+}
 
 // Usage requests must not wait on quota APIs (each can take up to 10s): serve the last reading
 // and refresh it in the background once it is a minute old. Only an explicit refresh waits.
+// Local T3 provider caches are always read fresh from disk.
 export async function readLimits(settings, force = false) {
-  if (!force && cache) {
-    if (Date.now() - cache.time >= 60000 && !refreshing) {
-      refreshing = fetchLimits(settings).catch(() => {}).finally(() => { refreshing = null; });
+  if (!force && customCache) {
+    if (Date.now() - customCache.time >= 60000 && !refreshing) {
+      refreshing = fetchCustomLimits(settings).catch(() => null).finally(() => { refreshing = null; });
     }
-    return cache.value;
+    return mergeLimits(customCache.value, settings);
   }
-  return refreshing && !force ? refreshing.then(() => cache?.value ?? fetchLimits(settings)) : fetchLimits(settings);
+  if (!force) {
+    refreshing ??= fetchCustomLimits(settings).finally(() => { refreshing = null; });
+    const custom = await refreshing;
+    return mergeLimits(custom ?? customCache?.value ?? await fetchCustomLimits(settings), settings);
+  }
+  return mergeLimits(await fetchCustomLimits(settings), settings);
 }
 
-let fetchGeneration = 0;
-
-async function fetchLimits(settings) {
+async function fetchCustomLimits(settings) {
   // A slow background refresh must not replace a newer forced one that finished first.
   const generation = ++fetchGeneration;
-  const cached = readT3Limits();
-  const custom = config.liveLimits
+  const value = config.liveLimits
     ? withLastGood(await Promise.all([readZaiLimits(settings), readKimiLimits(settings)]))
     : [
         { id: "zai-live", provider: "zai", label: "Z.ai / GLM", ...unavailable("Live limit lookup is disabled.", "unsupported"), source: "Z.ai quota API" },
         { id: "kimi-live", provider: "kimi", label: "Kimi Code", ...unavailable("Live limit lookup is disabled.", "unsupported"), source: "Kimi managed API" },
       ];
-  const value = [...cached, ...custom].sort((a, b) => a.label.localeCompare(b.label));
-  if (generation === fetchGeneration || !cache) cache = { time: Date.now(), value };
+  if (generation === fetchGeneration || !customCache) customCache = { time: Date.now(), value };
   return value;
 }
