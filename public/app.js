@@ -14,6 +14,19 @@ const PROVIDERS = {
 };
 const providerLabel = (provider) => PROVIDERS[provider]?.label ?? provider ?? "Unknown";
 const providerColor = (provider) => PROVIDERS[provider]?.color ?? "var(--muted-foreground)";
+const ACCOUNT_SHADES = [
+  (base) => base,
+  (base) => `color-mix(in oklab, ${base} 58%, #ffffff)`,
+  (base) => `color-mix(in oklab, ${base} 65%, #1c1917)`,
+  (base) => `color-mix(in oklab, ${base} 38%, #ffffff)`,
+  (base) => `color-mix(in oklab, ${base} 72%, #fbbf24)`,
+  (base) => `color-mix(in oklab, ${base} 72%, #60a5fa)`,
+];
+function accountColor(provider, index) {
+  const base = providerColor(provider);
+  return ACCOUNT_SHADES[index % ACCOUNT_SHADES.length](base);
+}
+const seriesKey = (provider, accountId) => (accountId ? `${provider}::${accountId}` : provider);
 const ink = (percent) => `color-mix(in oklab, var(--foreground) ${percent}%, var(--background))`;
 const TYPE_COLORS = { input: ink(60), cacheRead: ink(30), cacheWrite: ink(72), output: ink(100) };
 
@@ -50,6 +63,18 @@ function writePreference(key, value) {
   try { localStorage.setItem(`usage.${key}`, value); } catch { /* storage unavailable */ }
 }
 
+function readHiddenSeries() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("usage.hiddenSeries") ?? "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+function writeHiddenSeries() {
+  writePreference("hiddenSeries", JSON.stringify([...state.hiddenSeries]));
+}
+
 const state = {
   days: Number(readPreference("days", "7", (v) => ["1", "7", "30", "90"].includes(v))),
   metric: readPreference("metric", "cost", (v) => ["cost", "tokens", "limits"].includes(v)),
@@ -59,6 +84,7 @@ const state = {
   requestId: 0,
   editingRenewal: null,
   savingRenewal: false,
+  hiddenSeries: readHiddenSeries(),
 };
 
 function windowBounds(days = state.days) {
@@ -309,6 +335,43 @@ function render() {
 
 /* ---------- Usage ---------- */
 
+function shadeIndexMap(provider, accounts) {
+  const defaultId = provider === "claude" ? "claudeAgent" : provider;
+  const sortedIds = accounts.map((a) => a.id).sort((a, b) =>
+    a === defaultId ? -1 : b === defaultId ? 1 : a.localeCompare(b),
+  );
+  return new Map(sortedIds.map((id, index) => [id, index]));
+}
+
+function buildChartSeries(providers, metric) {
+  const value = (row) => (metric === "tokens" ? row.totalTokens : row.costUsd);
+  const series = [];
+  for (const row of providers) {
+    const accounts = (row.accounts ?? []).filter((a) => a.totalTokens > 0 || a.costUsd > 0);
+    if (row.multiAccount && accounts.length > 0) {
+      const shades = shadeIndexMap(row.provider, accounts);
+      for (const account of [...accounts].sort((a, b) => value(b) - value(a))) {
+        series.push({
+          key: seriesKey(row.provider, account.id),
+          provider: row.provider,
+          accountId: account.id,
+          label: account.label,
+          color: accountColor(row.provider, shades.get(account.id) ?? 0),
+        });
+      }
+    } else {
+      series.push({
+        key: seriesKey(row.provider, null),
+        provider: row.provider,
+        accountId: null,
+        label: providerLabel(row.provider),
+        color: providerColor(row.provider),
+      });
+    }
+  }
+  return series;
+}
+
 function renderUsage() {
   const data = state.data;
   const metric = state.metric === "tokens" ? "tokens" : "cost";
@@ -320,19 +383,84 @@ function renderUsage() {
   const unpricedShare = summary.totalTokens > 0 ? summary.unpricedTokens / summary.totalTokens : 0;
   const { hourly, periods } = periodsFor(data.meta);
 
+  const chartSeries = buildChartSeries(providers, metric);
+  const visibleSeries = chartSeries.filter((item) => !state.hiddenSeries.has(item.key));
+  const hiddenCount = chartSeries.length - visibleSeries.length;
+
   const providerRows = providers.map((row) => {
     const share = metric === "cost" ? (totalCost > 0 ? row.costUsd / totalCost : 0) : (totalTokens > 0 ? row.totalTokens / totalTokens : 0);
     const sub = metric === "cost"
       ? `${formatPercent(share)} of cost · ${formatTokens(row.totalTokens)} tokens`
       : `${formatPercent(share)} of tokens · ${formatUsd(row.costUsd)}`;
-    return `<div class="provider">
-      <dl>
-        <dt><span class="dot" style="background:${providerColor(row.provider)}"></span>
-          <span class="truncate">${escapeHtml(providerLabel(row.provider))}</span>
-          <span class="sessions figure">${plural(row.sessions, "session", "sessions")}</span></dt>
-        <dd class="figure">${metric === "cost" ? (row.costSource === "unpriced" ? '<span class="muted">Unpriced</span>' : formatUsd(row.costUsd)) : formatTokens(row.totalTokens)}</dd>
-      </dl>
-      <p class="provider-sub figure">${sub}</p>
+    const accounts = (row.accounts ?? []).filter((a) => a.totalTokens > 0 || a.costUsd > 0);
+    const isMulti = row.multiAccount && accounts.length > 0;
+    const baseColor = providerColor(row.provider);
+    const amount = metric === "cost"
+      ? (row.costSource === "unpriced" ? '<span class="muted">Unpriced</span>' : formatUsd(row.costUsd))
+      : formatTokens(row.totalTokens);
+
+    if (!isMulti) {
+      const key = seriesKey(row.provider, null);
+      const visible = !state.hiddenSeries.has(key);
+      return `<div class="provider${visible ? "" : " off"}">
+        <div class="provider-row">
+          <button type="button" class="provider-toggle" data-toggle-series="${escapeHtml(key)}" aria-pressed="${visible}" title="Toggle ${escapeHtml(providerLabel(row.provider))} on chart">
+            <dl>
+              <dt><span class="dot${visible ? "" : " off"}" style="--dot-color:${baseColor}"></span>
+                <span class="truncate">${escapeHtml(providerLabel(row.provider))}</span>
+                <span class="sessions figure">${plural(row.sessions, "session", "sessions")}</span></dt>
+              <dd class="figure">${amount}</dd>
+            </dl>
+            <p class="provider-sub figure">${sub}</p>
+          </button>
+          <button type="button" class="solo-btn" data-solo-series="${escapeHtml(key)}" title="Show only ${escapeHtml(providerLabel(row.provider))}">Only</button>
+        </div>
+      </div>`;
+    }
+
+    const shades = shadeIndexMap(row.provider, accounts);
+    const sortedAccounts = [...accounts].sort((a, b) => value(b) - value(a));
+    const accountKeys = sortedAccounts.map((a) => seriesKey(row.provider, a.id));
+    const visibleAccountCount = accountKeys.filter((k) => !state.hiddenSeries.has(k)).length;
+    const parentState = visibleAccountCount === 0 ? "off" : visibleAccountCount < accountKeys.length ? "partial" : "on";
+
+    const nestedRows = sortedAccounts.map((account) => {
+      const key = seriesKey(row.provider, account.id);
+      const visible = !state.hiddenSeries.has(key);
+      const shade = accountColor(row.provider, shades.get(account.id) ?? 0);
+      const accShare = metric === "cost"
+        ? (totalCost > 0 ? account.costUsd / totalCost : 0)
+        : (totalTokens > 0 ? account.totalTokens / totalTokens : 0);
+      const accAmount = metric === "cost"
+        ? (account.costSource === "unpriced" ? '<span class="muted">Unpriced</span>' : formatUsd(account.costUsd))
+        : formatTokens(account.totalTokens);
+      return `<div class="provider-row nested-row${visible ? "" : " off"}">
+        <button type="button" class="provider-toggle nested-toggle" data-toggle-series="${escapeHtml(key)}" aria-pressed="${visible}" title="Toggle ${escapeHtml(account.label)} on chart">
+          <dl>
+            <dt><span class="dot sm${visible ? "" : " off"}" style="--dot-color:${shade}"></span>
+              <span class="truncate">${escapeHtml(account.label)}</span>
+              <span class="sessions figure">${formatPercent(accShare)}</span></dt>
+            <dd class="figure">${accAmount}</dd>
+          </dl>
+        </button>
+        <button type="button" class="solo-btn" data-solo-series="${escapeHtml(key)}" title="Show only ${escapeHtml(account.label)}">Only</button>
+      </div>`;
+    }).join("");
+
+    return `<div class="provider provider-group${parentState === "off" ? " off" : ""}">
+      <div class="provider-row">
+        <button type="button" class="provider-toggle" data-toggle-provider="${escapeHtml(row.provider)}" aria-pressed="${parentState !== "off"}" title="Toggle all ${escapeHtml(providerLabel(row.provider))} accounts on chart">
+          <dl>
+            <dt><span class="dot ${parentState === "off" ? "off" : parentState === "partial" ? "partial" : ""}" style="--dot-color:${baseColor}"></span>
+              <span class="truncate">${escapeHtml(providerLabel(row.provider))}</span>
+              <span class="sessions figure">${plural(row.sessions, "session", "sessions")}</span></dt>
+            <dd class="figure">${amount}</dd>
+          </dl>
+          <p class="provider-sub figure">${sub}</p>
+        </button>
+        <button type="button" class="solo-btn" data-solo-provider="${escapeHtml(row.provider)}" title="Show only ${escapeHtml(providerLabel(row.provider))}">Only</button>
+      </div>
+      <div class="provider-accounts">${nestedRows}</div>
     </div>`;
   }).join("");
 
@@ -341,6 +469,11 @@ function renderUsage() {
     : "";
 
   const chartTitle = hourly ? (metric === "tokens" ? "Hourly processed tokens" : "Hourly cost") : (metric === "tokens" ? "Daily processed tokens" : "Daily cost");
+  const chartFilterMeta = hiddenCount > 0
+    ? `<span class="chart-filter-meta">Showing ${visibleSeries.length} of ${chartSeries.length} · <button type="button" class="link-btn" data-show-all-series>Show all</button></span>`
+    : chartSeries.length > 1
+      ? '<span class="chart-filter-meta muted">Click providers to filter</span>'
+      : "";
   const totals = summary.totals;
   const shares = metric === "tokens"
     ? shareBar("Tokens by type", [
@@ -366,7 +499,10 @@ function renderUsage() {
         ${providerRows || '<p class="muted">No activity in this window.</p>'}
       </div>
       <div class="chart-col">
-        <h2>${chartTitle}</h2>
+        <div class="chart-head">
+          <h2>${chartTitle}</h2>
+          ${chartFilterMeta}
+        </div>
         <div id="chart"></div>
       </div>
     </section>
@@ -397,7 +533,7 @@ function renderUsage() {
 
     ${footnote()}
   `;
-  renderChart(providers.map((row) => row.provider), periods, hourly, metric);
+  renderChart(visibleSeries, chartSeries.length, periods, hourly, metric);
 }
 
 const metricCell = (label, value) => `<div class="metric"><dt>${label}</dt><dd class="figure">${value}</dd></div>`;
@@ -492,10 +628,9 @@ function niceScale(peak) {
   return { max: step * TICK_COUNT, ticks: Array.from({ length: TICK_COUNT + 1 }, (_, i) => i * step) };
 }
 
-function monotonePath(points) {
-  if (points.length === 0) return "";
-  if (points.length === 1) return `M${points[0].x},${points[0].y}`;
+function monotoneSegments(points) {
   const n = points.length;
+  if (n < 2) return [];
   const slopes = [];
   for (let i = 0; i < n - 1; i++) slopes.push((points[i + 1].y - points[i].y) / (points[i + 1].x - points[i].x));
   const tangents = [slopes[0]];
@@ -508,26 +643,88 @@ function monotonePath(points) {
     const h = a * a + b * b;
     if (h > 9) { const t = 3 / Math.sqrt(h); tangents[i] = t * a * slopes[i]; tangents[i + 1] = t * b * slopes[i]; }
   }
-  let path = `M${points[0].x.toFixed(2)},${points[0].y.toFixed(2)}`;
+  const segments = [];
   for (let i = 0; i < n - 1; i++) {
     const p = points[i], q = points[i + 1], dx = (q.x - p.x) / 3;
-    path += ` C${(p.x + dx).toFixed(2)},${(p.y + tangents[i] * dx).toFixed(2)} ${(q.x - dx).toFixed(2)},${(q.y - tangents[i + 1] * dx).toFixed(2)} ${q.x.toFixed(2)},${q.y.toFixed(2)}`;
+    segments.push({
+      p0: p,
+      c1: { x: p.x + dx, y: p.y + tangents[i] * dx },
+      c2: { x: q.x - dx, y: q.y - tangents[i + 1] * dx },
+      p1: q,
+    });
+  }
+  return segments;
+}
+
+function forwardPath(points, segments) {
+  if (points.length === 0) return "";
+  if (points.length === 1) return `M${points[0].x.toFixed(2)},${points[0].y.toFixed(2)}`;
+  let path = `M${points[0].x.toFixed(2)},${points[0].y.toFixed(2)}`;
+  for (const s of segments) {
+    path += ` C${s.c1.x.toFixed(2)},${s.c1.y.toFixed(2)} ${s.c2.x.toFixed(2)},${s.c2.y.toFixed(2)} ${s.p1.x.toFixed(2)},${s.p1.y.toFixed(2)}`;
   }
   return path;
 }
 
-function renderChart(providers, periods, hourly, metric) {
+function bandPath(topPoints, topSegments, bottomPoints, bottomSegments) {
+  if (topPoints.length === 0) return "";
+  if (topPoints.length === 1) {
+    const x = topPoints[0].x;
+    const w = 12;
+    return `M${(x - w).toFixed(2)},${topPoints[0].y.toFixed(2)} L${(x + w).toFixed(2)},${topPoints[0].y.toFixed(2)} L${(x + w).toFixed(2)},${bottomPoints[0].y.toFixed(2)} L${(x - w).toFixed(2)},${bottomPoints[0].y.toFixed(2)} Z`;
+  }
+  let path = forwardPath(topPoints, topSegments);
+  const lastBottom = bottomPoints.at(-1);
+  path += ` L${lastBottom.x.toFixed(2)},${lastBottom.y.toFixed(2)}`;
+  for (let i = bottomSegments.length - 1; i >= 0; i--) {
+    const s = bottomSegments[i];
+    path += ` C${s.c2.x.toFixed(2)},${s.c2.y.toFixed(2)} ${s.c1.x.toFixed(2)},${s.c1.y.toFixed(2)} ${s.p0.x.toFixed(2)},${s.p0.y.toFixed(2)}`;
+  }
+  return `${path} Z`;
+}
+
+function renderChart(visibleSeries, totalSeriesCount, periods, hourly, metric) {
   const host = $("chart");
-  const byKey = new Map(state.data.trend.map((point) => [`${point.bucket}\0${point.provider}`, point]));
-  const valueAt = (period, provider) => {
-    const point = byKey.get(`${period}\0${provider}`);
-    return point ? (metric === "tokens" ? point.tokens : point.costUsd) : 0;
-  };
-  if (providers.length === 0 || periods.length === 0) {
+  if (totalSeriesCount === 0 || periods.length === 0) {
     host.innerHTML = '<div class="chart-empty">No activity in this window.</div>';
     return;
   }
-  const peak = Math.max(0, ...periods.flatMap((period) => providers.map((provider) => valueAt(period, provider))));
+  if (visibleSeries.length === 0) {
+    host.innerHTML = '<div class="chart-empty">No providers selected. Click a provider to show it on the chart.</div>';
+    return;
+  }
+  const byProviderKey = new Map(state.data.trend.map((point) => [`${point.bucket}\0${point.provider}`, point]));
+  const byAccountKey = new Map((state.data.accountTrend ?? []).map((point) => [`${point.bucket}\0${point.provider}\0${point.accountId}`, point]));
+  const valueAt = (period, item) => {
+    const point = item.accountId
+      ? byAccountKey.get(`${period}\0${item.provider}\0${item.accountId}`)
+      : byProviderKey.get(`${period}\0${item.provider}`);
+    return point ? (metric === "tokens" ? point.tokens : point.costUsd) : 0;
+  };
+
+  // Group visible series by provider so multi-account providers render as nested stacked bands
+  // inside a single combined provider envelope, rather than separate overlapping curves from 0.
+  const groups = [];
+  const groupByProvider = new Map();
+  for (const item of visibleSeries) {
+    let group = groupByProvider.get(item.provider);
+    if (!group) {
+      group = {
+        provider: item.provider,
+        label: providerLabel(item.provider),
+        color: providerColor(item.provider),
+        items: [],
+      };
+      groupByProvider.set(item.provider, group);
+      groups.push(group);
+    }
+    group.items.push(item);
+  }
+
+  const groupTotalAt = (period, group) =>
+    group.items.reduce((sum, item) => sum + valueAt(period, item), 0);
+
+  const peak = Math.max(0, ...periods.flatMap((period) => groups.map((group) => groupTotalAt(period, group))));
   const scale = niceScale(peak);
   const toY = (value) => VIEW_HEIGHT - (value / scale.max) * (VIEW_HEIGHT - PLOT_TOP);
   const stepX = periods.length > 1 ? VIEW_WIDTH / (periods.length - 1) : 0;
@@ -536,14 +733,40 @@ function renderChart(providers, periods, hourly, metric) {
   const axisFormat = metric === "tokens" ? formatTokens : (value) => (value >= 10 ? usdWhole.format(value) : formatUsd(value));
 
   const grid = scale.ticks.map((tick) => `<line x1="0" x2="${VIEW_WIDTH}" y1="${toY(tick)}" y2="${toY(tick)}" stroke="var(--border)" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join("");
-  const series = providers.map((provider) => {
-    const points = periods.map((period, index) => ({ x: toX(index), y: toY(valueAt(period, provider)) }));
-    const line = monotonePath(points);
-    const area = `${line} L${points.at(-1).x.toFixed(2)},${VIEW_HEIGHT} L${points[0].x.toFixed(2)},${VIEW_HEIGHT} Z`;
-    return { provider, line, area };
-  });
-  const areas = series.map((s) => `<path d="${s.area}" fill="${providerColor(s.provider)}" fill-opacity="0.12"/>`).join("");
-  const lines = series.map((s) => `<path d="${s.line}" fill="none" stroke="${providerColor(s.provider)}" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join("");
+  const baselinePoints = periods.map((_, index) => ({ x: toX(index), y: VIEW_HEIGHT }));
+  const baselineSegments = monotoneSegments(baselinePoints);
+
+  const areaPaths = [];
+  const innerLinePaths = [];
+  const outerLinePaths = [];
+
+  for (const group of groups) {
+    const isNested = group.items.length > 1;
+    let prevTotals = periods.map(() => 0);
+    let prevPoints = baselinePoints;
+    let prevSegments = baselineSegments;
+
+    for (let i = 0; i < group.items.length; i++) {
+      const item = group.items[i];
+      const nextTotals = periods.map((period, idx) => prevTotals[idx] + valueAt(period, item));
+      const nextPoints = nextTotals.map((val, idx) => ({ x: toX(idx), y: toY(val) }));
+      const nextSegments = monotoneSegments(nextPoints);
+      const area = bandPath(nextPoints, nextSegments, prevPoints, prevSegments);
+      areaPaths.push(`<path d="${area}" fill="${item.color}" fill-opacity="${isNested ? "0.34" : "0.14"}"/>`);
+      if (isNested && i < group.items.length - 1) {
+        const innerLine = forwardPath(nextPoints, nextSegments);
+        innerLinePaths.push(`<path d="${innerLine}" fill="none" stroke="${item.color}" stroke-width="1" stroke-opacity="0.6" vector-effect="non-scaling-stroke"/>`);
+      }
+      prevTotals = nextTotals;
+      prevPoints = nextPoints;
+      prevSegments = nextSegments;
+    }
+
+    const outerColor = isNested ? group.color : group.items[0].color;
+    const outerLine = forwardPath(prevPoints, prevSegments);
+    outerLinePaths.push(`<path d="${outerLine}" fill="none" stroke="${outerColor}" stroke-width="2" vector-effect="non-scaling-stroke"/>`);
+  }
+
   const yLabels = scale.ticks.map((tick) => `<span style="top:${(toY(tick) / VIEW_HEIGHT) * 100}%">${tick === 0 ? "0" : escapeHtml(axisFormat(tick))}</span>`).join("");
   const mid = periods[Math.floor(periods.length / 2)];
 
@@ -552,7 +775,7 @@ function renderChart(providers, periods, hourly, metric) {
       <div class="y-axis" aria-hidden="true">${yLabels}</div>
       <div class="plot" role="img" aria-label="${escapeHtml(`${hourly ? "Hourly" : "Daily"} ${metric === "tokens" ? "tokens" : "cost"} by provider`)}">
         <svg viewBox="0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}" preserveAspectRatio="none">
-          ${grid}${areas}${lines}
+          ${grid}${areaPaths.join("")}${innerLinePaths.join("")}${outerLinePaths.join("")}
           <line id="guide" x1="0" x2="0" y1="${PLOT_TOP}" y2="${VIEW_HEIGHT}" stroke="var(--muted-foreground)" stroke-width="1" stroke-dasharray="3 3" vector-effect="non-scaling-stroke" visibility="hidden"/>
         </svg>
       </div>
@@ -571,11 +794,29 @@ function renderChart(providers, periods, hourly, metric) {
     guide.setAttribute("x1", x);
     guide.setAttribute("x2", x);
     guide.setAttribute("visibility", "visible");
-    const values = providers.map((provider) => [provider, valueAt(period, provider)]).sort((a, b) => b[1] - a[1]);
-    const total = values.reduce((sum, [, v]) => sum + v, 0);
+    const groupRows = groups
+      .map((group) => {
+        const children = group.items
+          .map((item) => ({ item, value: valueAt(period, item) }))
+          .sort((a, b) => b.value - a.value);
+        const total = children.reduce((sum, c) => sum + c.value, 0);
+        return { group, children, total };
+      })
+      .sort((a, b) => b.total - a.total);
+    const grandTotal = groupRows.reduce((sum, row) => sum + row.total, 0);
+    const rowsHtml = groupRows.map(({ group, children, total }) => {
+      if (children.length === 1) {
+        const only = children[0];
+        return `<div class="tt-row"><span><span class="dot" style="background:${only.item.color}"></span>${escapeHtml(only.item.label)}</span><span class="tt-value">${escapeHtml(format(only.value))}</span></div>`;
+      }
+      const nestedHtml = children.map(({ item, value }) =>
+        `<div class="tt-row tt-nested"><span><span class="dot sm" style="background:${item.color}"></span>${escapeHtml(item.label)}</span><span class="tt-value">${escapeHtml(format(value))}</span></div>`,
+      ).join("");
+      return `<div class="tt-row"><span><span class="dot" style="background:${group.color}"></span>${escapeHtml(group.label)}</span><span class="tt-value">${escapeHtml(format(total))}</span></div>${nestedHtml}`;
+    }).join("");
     showTooltip(`<div class="tt-title">${escapeHtml(formatPeriod(period, hourly))}</div>
-      ${values.map(([provider, v]) => `<div class="tt-row"><span><span class="dot" style="background:${providerColor(provider)}"></span>${escapeHtml(providerLabel(provider))}</span><span class="tt-value">${escapeHtml(format(v))}</span></div>`).join("")}
-      <div class="tt-row tt-total"><span>Total</span><span class="tt-value">${escapeHtml(format(total))}</span></div>`,
+      ${rowsHtml}
+      <div class="tt-row tt-total"><span>Total</span><span class="tt-value">${escapeHtml(format(grandTotal))}</span></div>`,
       bounds.left + (x / VIEW_WIDTH) * bounds.width, bounds.top);
   });
   plot.addEventListener("pointerleave", () => {
@@ -962,10 +1203,73 @@ for (const button of document.querySelectorAll("[data-metric]")) {
   });
 }
 $("usageView").addEventListener("click", (event) => {
-  const button = event.target instanceof Element ? event.target.closest("[data-breakdown]") : null;
-  if (!button) return;
-  state.breakdown = button.dataset.breakdown;
-  renderUsage();
+  if (!(event.target instanceof Element)) return;
+  const breakdown = event.target.closest("[data-breakdown]");
+  if (breakdown) {
+    state.breakdown = breakdown.dataset.breakdown;
+    renderUsage();
+    return;
+  }
+  if (!state.data) return;
+  const activeProviders = state.data.providers.filter((row) => row.totalTokens > 0 || row.costUsd > 0);
+  const allSeries = buildChartSeries(activeProviders, state.metric === "tokens" ? "tokens" : "cost");
+  const allKeys = allSeries.map((item) => item.key);
+
+  if (event.target.closest("[data-show-all-series]")) {
+    state.hiddenSeries.clear();
+    writeHiddenSeries();
+    renderUsage();
+    return;
+  }
+  const soloSeries = event.target.closest("[data-solo-series]");
+  if (soloSeries) {
+    const target = soloSeries.dataset.soloSeries;
+    const visible = allKeys.filter((k) => !state.hiddenSeries.has(k));
+    if (visible.length === 1 && visible[0] === target) {
+      state.hiddenSeries.clear();
+    } else {
+      state.hiddenSeries = new Set(allKeys.filter((k) => k !== target));
+    }
+    writeHiddenSeries();
+    renderUsage();
+    return;
+  }
+  const soloProvider = event.target.closest("[data-solo-provider]");
+  if (soloProvider) {
+    const provider = soloProvider.dataset.soloProvider;
+    const targetKeys = new Set(allSeries.filter((item) => item.provider === provider).map((item) => item.key));
+    const visible = allKeys.filter((k) => !state.hiddenSeries.has(k));
+    const alreadySolo = visible.length === targetKeys.size && visible.every((k) => targetKeys.has(k));
+    if (alreadySolo) {
+      state.hiddenSeries.clear();
+    } else {
+      state.hiddenSeries = new Set(allKeys.filter((k) => !targetKeys.has(k)));
+    }
+    writeHiddenSeries();
+    renderUsage();
+    return;
+  }
+  const toggleSeries = event.target.closest("[data-toggle-series]");
+  if (toggleSeries) {
+    const key = toggleSeries.dataset.toggleSeries;
+    if (state.hiddenSeries.has(key)) state.hiddenSeries.delete(key);
+    else state.hiddenSeries.add(key);
+    writeHiddenSeries();
+    renderUsage();
+    return;
+  }
+  const toggleProvider = event.target.closest("[data-toggle-provider]");
+  if (toggleProvider) {
+    const provider = toggleProvider.dataset.toggleProvider;
+    const keys = allSeries.filter((item) => item.provider === provider).map((item) => item.key);
+    const anyVisible = keys.some((k) => !state.hiddenSeries.has(k));
+    for (const k of keys) {
+      if (anyVisible) state.hiddenSeries.add(k);
+      else state.hiddenSeries.delete(k);
+    }
+    writeHiddenSeries();
+    renderUsage();
+  }
 });
 $("limitsView").addEventListener("click", (event) => {
   if (!(event.target instanceof Element)) return;
