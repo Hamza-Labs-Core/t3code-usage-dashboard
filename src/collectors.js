@@ -37,7 +37,7 @@ export function readPricing(settings) {
 // T3 rewrites its 46 MB usage cache only when it rescans, so reuse the decode until the file changes.
 let t3UsageMemo = null;
 
-export function readT3Usage() {
+export function readT3Usage(force = false) {
   const file = path.join(config.t3Userdata, "usage-scan-cache-v17.json");
   const info = stat(file);
   const memoKey = info ? `${info.mtimeMs}:${info.size}` : null;
@@ -51,7 +51,7 @@ export function readT3Usage() {
   if (!value.scanned) return value;
   // T3 saves this cache only now and then, but its Usage page reads live transcripts.
   // Read what Claude wrote after the last save so both show the same numbers.
-  const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs);
+  const unsaved = readUnsavedClaudeUsage(value.scanned, value.claudeDirs, info.mtimeMs, force);
   if (unsaved.length === 0) return value;
   return {
     records: [...value.records, ...unsaved],
@@ -63,7 +63,7 @@ const claudeTailMemo = new Map();
 let claudeListing = null;
 const LISTING_TTL_MS = 15000;
 
-function readUnsavedClaudeUsage(scanned, dirs, savedAtMs) {
+function readUnsavedClaudeUsage(scanned, dirs, savedAtMs, force = false) {
   const records = [];
   const live = new Set();
   for (const [file, scannedSize] of scanned) {
@@ -74,7 +74,7 @@ function readUnsavedClaudeUsage(scanned, dirs, savedAtMs) {
     }
   }
   // New transcripts started after the save are not in the cache at all.
-  for (const file of listClaudeTranscripts(dirs)) {
+  for (const file of listClaudeTranscripts(dirs, force)) {
     if (scanned.has(file)) continue;
     const info = stat(file);
     if (!info || info.mtimeMs < savedAtMs - 60000) continue;
@@ -85,9 +85,9 @@ function readUnsavedClaudeUsage(scanned, dirs, savedAtMs) {
   return records;
 }
 
-function listClaudeTranscripts(dirs) {
+function listClaudeTranscripts(dirs, force = false) {
   const key = dirs.join("\0");
-  if (claudeListing?.key === key && Date.now() - claudeListing.at < LISTING_TTL_MS) return claudeListing.files;
+  if (!force && claudeListing?.key === key && Date.now() - claudeListing.at < LISTING_TTL_MS) return claudeListing.files;
   const files = [];
   for (const dir of dirs) {
     let names = [];
