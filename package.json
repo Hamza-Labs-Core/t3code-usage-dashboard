@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/server.js && node --check src/collectors.js && node --check src/limits.js && node --check src/usage.js && node --check public/app.js"
+    "check": "node --check src/server.js && node --check src/collectors.js && node --check src/limits.js && node --check src/renewals.js && node --check src/usage.js && node --check public/app.js"
   },
   "dependencies": {
     "smol-toml": "^1.9.1"

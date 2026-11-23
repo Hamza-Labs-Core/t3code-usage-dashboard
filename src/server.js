@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readKimiUsage, readPricing, readT3Settings, readT3Usage, readZaiUsage } from "./collectors.js";
 import { readLimits } from "./limits.js";
+import { saveRenewalOverride } from "./renewals.js";
 import { aggregateRecords } from "./usage.js";
 import { safeError } from "./util.js";
 
@@ -31,7 +32,7 @@ async function dashboard(url) {
   const force = url.searchParams.get("refresh") === "1";
   const settings = readT3Settings();
   const pricing = readPricing(settings);
-  const t3 = readT3Usage();
+  const t3 = readT3Usage(force);
   const zai = readZaiUsage(settings, sinceMs);
   const [kimi, limits] = await Promise.all([readKimiUsage(sinceMs), readLimits(settings, force)]);
   const sources = [t3.source, zai.source, kimi.source];
@@ -59,6 +60,30 @@ async function dashboard(url) {
       recordsScanned: records.length,
     },
   };
+}
+
+function readJsonBody(request, maxBytes = 16384) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error("Request body too large."));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch {
+        reject(new Error("Invalid JSON body."));
+      }
+    });
+    request.on("error", reject);
+  });
 }
 
 function json(response, status, value) {
@@ -94,6 +119,15 @@ const server = http.createServer(async (request, response) => {
     }
     if (url.pathname === "/api/health") return json(response, 200, { ok: true });
     if (url.pathname === "/api/dashboard") return json(response, 200, await dashboard(url));
+    if (url.pathname === "/api/limits") {
+      const force = url.searchParams.get("refresh") === "1";
+      return json(response, 200, { limits: await readLimits(readT3Settings(), force), readAt: new Date().toISOString() });
+    }
+    if (url.pathname === "/api/renewals" && request.method === "PUT") {
+      const body = await readJsonBody(request);
+      saveRenewalOverride(body?.accountId, { date: body?.date, cadence: body?.cadence });
+      return json(response, 200, { limits: await readLimits(readT3Settings(), false), readAt: new Date().toISOString() });
+    }
     if (url.pathname.startsWith("/api/")) return json(response, 404, { error: "Not found." });
     let relative;
     try {
